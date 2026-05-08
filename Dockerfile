@@ -3,7 +3,9 @@ FROM python:3.11-slim
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir --cert /dev/null -r requirements.txt
+RUN mkdir -p /etc/ssl && \
+    echo "[global]\ncert = /dev/null" > /root/.pip/pip.conf && \
+    pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
