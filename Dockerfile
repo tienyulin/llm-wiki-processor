@@ -3,7 +3,7 @@ FROM python:3.11-slim
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir --no-verify-ssl -r requirements.txt
+RUN pip install --no-cache-dir --trusted-host pypi.org --trusted-host pypi.python.org -r requirements.txt
 
 COPY . .
 
