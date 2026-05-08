@@ -7,8 +7,10 @@ Mode: Incremental updates via prompt caching
 """
 
 import asyncio
+import io
 import json
 import logging
+import re
 from datetime import datetime
 from typing import Optional
 from functools import lru_cache
@@ -105,7 +107,7 @@ async def save_snapshot(markdowns: dict) -> None:
 
     data = json.dumps(markdowns, ensure_ascii=False, indent=2).encode()
     try:
-        minio.put_object(bucket, "markdowns_snapshot.json", data, len(data))
+        minio.put_object(bucket, "markdowns_snapshot.json", io.BytesIO(data), len(data))
         logger.info("Saved snapshot to Minio")
     except S3Error as e:
         logger.error(f"Failed to save snapshot: {e}")
@@ -139,7 +141,7 @@ async def save_wiki(wiki: dict) -> None:
 
     data = json.dumps(wiki, ensure_ascii=False, indent=2).encode()
     try:
-        minio.put_object(bucket, "wiki.json", data, len(data))
+        minio.put_object(bucket, "wiki.json", io.BytesIO(data), len(data))
         logger.info("Saved wiki.json to Minio")
     except S3Error as e:
         logger.error(f"Failed to save wiki: {e}")
@@ -173,6 +175,22 @@ def detect_changes(old_snapshot: dict, new_markdowns: dict) -> dict:
 # LLM Integration (Minimax)
 # ============================================================================
 
+MINIMAX_API_URL = "https://api.minimax.io/v1/text/chatcompletion_v2"
+MINIMAX_MODEL = "MiniMax-M2.7"
+
+
+def extract_json(content: str) -> dict:
+    """Remove <think>...</think> tags and extract JSON from LLM response."""
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", content, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        raise
+
+
 async def call_minimax_initial(markdowns: dict) -> dict:
     """
     First run: Analyze all markdowns and generate complete wiki.
@@ -200,10 +218,10 @@ Output ONLY valid JSON, no markdown.
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
-                "https://api.minimax.chat/v1/text/completions",
+                MINIMAX_API_URL,
                 headers={"Authorization": f"Bearer {api_key}"},
                 json={
-                    "model": "abab6.5-chat",
+                    "model": MINIMAX_MODEL,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.3,
                 },
@@ -212,10 +230,8 @@ Output ONLY valid JSON, no markdown.
             response.raise_for_status()
             result = response.json()
 
-            # Extract JSON from response
             content = result["choices"][0]["message"]["content"]
-            # Try to parse JSON from response
-            wiki = json.loads(content)
+            wiki = extract_json(content)
             logger.info("Successfully generated initial wiki")
             return wiki
 
@@ -268,10 +284,10 @@ Output ONLY the updated wiki JSON.
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
-                "https://api.minimax.chat/v1/text/completions",
+                MINIMAX_API_URL,
                 headers={"Authorization": f"Bearer {api_key}"},
                 json={
-                    "model": "abab6.5-chat",
+                    "model": MINIMAX_MODEL,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.2,
                 },
@@ -281,7 +297,7 @@ Output ONLY the updated wiki JSON.
             result = response.json()
 
             content = result["choices"][0]["message"]["content"]
-            updated_wiki = json.loads(content)
+            updated_wiki = extract_json(content)
             logger.info("Successfully performed incremental wiki update")
             return updated_wiki
 
