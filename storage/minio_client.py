@@ -24,6 +24,18 @@ class MinioStorage:
             secret_key=secret_key,
             secure=False,
         )
+        self._ensure_bucket()
+
+    def _ensure_bucket(self) -> None:
+        """Ensure bucket exists, create if not."""
+        try:
+            if not self.client.bucket_exists(self.bucket):
+                self.client.make_bucket(self.bucket)
+                logger.info(f"Created bucket: {self.bucket}")
+            else:
+                logger.debug(f"Bucket exists: {self.bucket}")
+        except Exception as e:
+            logger.warning(f"Could not ensure bucket existence: {e}")
 
     def get_json(self, key: str) -> dict | None:
         """Retrieve a JSON object from Minio. Returns None if key does not exist."""
