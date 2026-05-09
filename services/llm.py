@@ -22,6 +22,17 @@ api/
   ├── users.md           # Each module in separate file
   ├── orders.md
   └── inventory.md
+architecture/
+  ├── system.md
+  └── data-flow.md
+workflows/
+  ├── generation.md
+  └── incremental-update.md
+concepts/
+  ├── karpathy-wiki.md
+  └── snapshot.md
+guides/
+  └── extending-api.md
 ```
 
 ## Every File: YAML Frontmatter
@@ -31,16 +42,27 @@ Every markdown file MUST start with YAML frontmatter:
 ```yaml
 ---
 title: "Users API Module"
-type: "api_module"
-module: "users"
+type: "api_module"           # Must be one of: api_module, concept, workflow, guide, architecture, overview
+module: "users"              # Required for api_module only
 description: "User management and authentication APIs"
+
+# For API modules only - list all endpoints
 endpoints:
   - method: "GET"
     path: "/users"
     summary: "List all users"
-    tags: ["list", "users"]
+    tags: ["list", "users", "public"]
+  - method: "POST"
+    path: "/users"
+    summary: "Create a new user"
+    tags: ["create", "users"]
+
+# For all files - cross-references
 related:
   - "api/orders.md"
+  - "workflows/authentication.md"
+  - "concepts/user-model.md"
+
 tags: ["api", "users"]
 last_updated: "2025-02-15T10:30:00Z"
 ---
@@ -50,20 +72,73 @@ Type must be one of: api_module, concept, workflow, guide, architecture, overvie
 module and endpoints are required for api_module type only.
 Every file must have: title, type, description, related, tags, last_updated.
 
-## Wikilinks
+## Content Format
 
-Use [[Title]] format for cross-references. Link only to files that exist.
+After frontmatter, use standard Markdown. Key rules:
+
+### 1. Wikilinks for Cross-References
+
+Use `[[filename without .md]]` format:
+
+```markdown
+# Users Module
+
+This module is used by [[Orders Module]] and [[Inventory Module]].
+
+For authentication flow, see [[Authentication Workflow]].
+
+Related concept: [[User Data Model]]
+```
+
+**Important:** Link to actual files that exist.
+
+### 2. Self-Contained Sections
+
+Each file should have clear sections with examples and details.
+
+### 3. Consistent Tags
+
+Use standard tags (lowercase, hyphenated):
+- Operations: create, read, list, update, delete, search
+- Domains: users, orders, inventory
+- Properties: public, internal, deprecated
 
 ## Generation Rules
 
-1. Separate files by concern: one file per API module
-2. Hierarchical organization: api/, architecture/, workflows/, concepts/, guides/
-3. Tags: lowercase, hyphenated
+### Rule 1: Separate Files by Concern
+- ❌ Wrong: All APIs in one file
+- ✅ Right: api/users.md, api/orders.md, api/inventory.md
 
-## Output Format
+### Rule 2: Consistent Frontmatter
+Every file must have these fields:
+- `title` (string)
+- `type` (one of: api_module, concept, workflow, guide, architecture, overview)
+- `description` (one sentence)
+- `related` (array of file references)
+- `last_updated` (ISO 8601 format)
+
+For `type: api_module` also require:
+- `module` (module name)
+- `endpoints` (array with method, path, summary, tags)
+
+### Rule 3: Valid Wikilinks
+- Use `[[Name]]` format
+- Name should be descriptive but map to actual files
+- Examples: `[[Users Module]]` → api/users.md, `[[System Architecture]]` → architecture/system.md
+
+### Rule 4: Hierarchical Organization
+Group by semantic type:
+- **api/** → All API endpoints
+- **architecture/** → System design
+- **workflows/** → How things work internally
+- **concepts/** → Key ideas and patterns
+- **guides/** → How to extend and use
+
+### Rule 5: Output Format
 
 Return files using EXACTLY this format:
 
+```
 === FILE: overview.md ===
 ---
 title: "Project Name"
@@ -85,9 +160,14 @@ Content here...
 title: "Users API Module"
 type: "api_module"
 module: "users"
-description: "..."
-endpoints: []
-related: []
+description: "User management APIs"
+endpoints:
+  - method: "GET"
+    path: "/users"
+    summary: "List all users"
+    tags: ["list", "public"]
+related:
+  - "api/orders.md"
 tags: ["api", "users"]
 last_updated: "2025-02-15T10:30:00Z"
 ---
@@ -95,6 +175,20 @@ last_updated: "2025-02-15T10:30:00Z"
 Content here...
 
 === END FILE ===
+```
+
+## Validation Checklist
+
+Before returning files, verify:
+- [ ] Every file has complete frontmatter
+- [ ] No missing required fields (title, type, description, last_updated, related)
+- [ ] All wikilinks use `[[ ]]` format
+- [ ] No dead links (referenced files should exist)
+- [ ] api_module files have `module` and `endpoints` array
+- [ ] Consistent file organization (api/, architecture/, etc.)
+- [ ] Markdown is well-formatted
+- [ ] Tags are lowercase and hyphenated
+- [ ] last_updated is current date
 """
 
 
