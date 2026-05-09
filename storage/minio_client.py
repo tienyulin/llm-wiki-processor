@@ -72,3 +72,38 @@ class MinioStorage:
         except Exception as e:
             logger.error(f"✗ Failed to save {key} to Minio: {e}", exc_info=True)
             raise
+
+    def get_file(self, key: str) -> str | None:
+        """Retrieve a text file from Minio. Returns None if key does not exist."""
+        try:
+            obj = self.client.get_object(self.bucket, key)
+            return obj.read().decode()
+        except S3Error as e:
+            if e.code == "NoSuchKey":
+                return None
+            logger.error(f"✗ Minio error retrieving {key}: {e}", exc_info=True)
+            raise
+        except Exception as e:
+            logger.error(f"✗ Unexpected error retrieving {key}: {e}", exc_info=True)
+            raise
+
+    def put_file(self, key: str, content: str) -> None:
+        """Store a text file in Minio."""
+        try:
+            encoded = content.encode()
+            self.client.put_object(
+                self.bucket,
+                key,
+                io.BytesIO(encoded),
+                length=len(encoded),
+                content_type="text/markdown",
+            )
+            logger.info(f"✓ Saved {key} to Minio ({len(encoded)} bytes)")
+        except Exception as e:
+            logger.error(f"✗ Failed to save {key} to Minio: {e}", exc_info=True)
+            raise
+
+    def list_files(self, prefix: str = "") -> list[str]:
+        """List all object keys in the bucket under the given prefix."""
+        objects = self.client.list_objects(self.bucket, prefix=prefix, recursive=True)
+        return [obj.object_name for obj in objects]

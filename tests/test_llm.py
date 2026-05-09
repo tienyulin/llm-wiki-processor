@@ -1,4 +1,4 @@
-"""Tests for MinimaxClient.extract_json (no network, no async)."""
+"""Tests for MinimaxClient multifile parsing and validation."""
 import pytest
 from services.llm import MinimaxClient
 
@@ -8,32 +8,96 @@ def client():
     return MinimaxClient(api_key="test-key")
 
 
-def test_clean_json_string(client):
-    raw = '{"apis": {"users": {}}, "metadata": {}}'
-    result = client.extract_json(raw)
-    assert result == {"apis": {"users": {}}, "metadata": {}}
+VALID_MULTIFILE = """\
+=== FILE: overview.md ===
+---
+title: "Overview"
+type: "overview"
+description: "Project overview"
+related: []
+tags: ["overview"]
+last_updated: "2026-01-01T00:00:00Z"
+---
+
+# Overview
+
+Content here.
+
+=== END FILE ===
+
+=== FILE: llms.txt ===
+---
+title: "Index"
+type: "overview"
+description: "Wiki index"
+related: []
+tags: ["index"]
+last_updated: "2026-01-01T00:00:00Z"
+---
+
+# Index
+
+Browse api/, architecture/
+
+=== END FILE ===
+
+=== FILE: api/users.md ===
+---
+title: "Users API"
+type: "api_module"
+module: "users"
+description: "User APIs"
+endpoints: []
+related: []
+tags: ["api"]
+last_updated: "2026-01-01T00:00:00Z"
+---
+
+# Users API
+
+=== END FILE ===
+"""
 
 
-def test_json_with_think_tags(client):
-    raw = "<think>Let me think about this...</think>\n{\"apis\": {}, \"metadata\": {}}"
-    result = client.extract_json(raw)
-    assert result == {"apis": {}, "metadata": {}}
+def test_parse_multifile_output(client):
+    files = client._parse_multifile_output(VALID_MULTIFILE)
+    assert "overview.md" in files
+    assert "llms.txt" in files
+    assert "api/users.md" in files
+    assert "# Overview" in files["overview.md"]
+    assert "# Users API" in files["api/users.md"]
 
 
-def test_json_embedded_in_text(client):
-    raw = 'Here is the wiki:\n{"apis": {"orders": {}}, "metadata": {}}\nEnd of response.'
-    result = client.extract_json(raw)
-    assert result == {"apis": {"orders": {}}, "metadata": {}}
+def test_parse_multifile_output_no_blocks(client):
+    with pytest.raises(ValueError, match="no valid"):
+        client._parse_multifile_output("This has no file blocks.")
 
 
-def test_json_with_multiline_think_tags(client):
-    raw = (
-        "<think>\n"
-        "I need to parse these markdowns carefully.\n"
-        "Step 1: identify endpoints.\n"
-        "</think>\n"
-        '{"apis": {"payments": {"POST /pay": {}}}, "metadata": {"version": "1.0"}}'
-    )
-    result = client.extract_json(raw)
-    assert result["apis"]["payments"]["POST /pay"] == {}
-    assert result["metadata"]["version"] == "1.0"
+def test_validate_wiki_structure_valid(client):
+    files = client._parse_multifile_output(VALID_MULTIFILE)
+    client._validate_wiki_structure(files)  # Should not raise
+
+
+def test_validate_wiki_structure_missing_required(client):
+    files = {"api/users.md": "---\ntitle: Users\n---\n# Users"}
+    with pytest.raises(ValueError, match="Missing required"):
+        client._validate_wiki_structure(files)
+
+
+def test_validate_wiki_structure_missing_frontmatter(client):
+    files = {
+        "overview.md": "# No frontmatter here",
+        "llms.txt": "---\ntitle: Index\n---\n# Index",
+    }
+    with pytest.raises(ValueError, match="missing YAML frontmatter"):
+        client._validate_wiki_structure(files)
+
+
+def test_mock_response_is_valid(client):
+    import os
+    os.environ["MOCK_LLM"] = "true"
+    mock_client = MinimaxClient(api_key="test-key")
+    response = mock_client._mock_response()
+    files = mock_client._parse_multifile_output(response)
+    mock_client._validate_wiki_structure(files)
+    assert len(files) >= 2

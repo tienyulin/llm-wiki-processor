@@ -7,12 +7,7 @@ from storage.minio_client import MinioStorage
 
 logger = logging.getLogger(__name__)
 
-_WIKI_KEY = "wiki.json"
 _SNAPSHOT_KEY = "markdowns_snapshot.json"
-_DEFAULT_WIKI = {
-    "apis": {},
-    "metadata": {"version": "1.0", "created_at": datetime.now().isoformat()},
-}
 
 
 class WikiProcessor:
@@ -40,13 +35,25 @@ class WikiProcessor:
             "deleted": sorted(deleted),
         }
 
+    def _load_current_wiki_files(self) -> dict[str, str]:
+        """Load all current wiki files (non-JSON) from Minio."""
+        keys = self.storage.list_files()
+        files = {}
+        for key in keys:
+            if key.endswith(".json"):
+                continue
+            content = self.storage.get_file(key)
+            if content:
+                files[key] = content
+        return files
+
     async def process(self, markdowns: dict, timestamp: str) -> ProcessResponse:
         """
         Full pipeline:
         1. Get old snapshot from storage.
         2. Detect changes.
         3. Call LLM (initial or incremental).
-        4. Save updated wiki + new snapshot.
+        4. Save updated wiki files + new snapshot.
         """
         # Step 1: retrieve previous snapshot
         old_snapshot = self.storage.get_json(_SNAPSHOT_KEY) or {}
@@ -62,29 +69,29 @@ class WikiProcessor:
 
         # Step 3: call LLM
         if is_first_run:
-            wiki = await self.llm.generate_wiki(markdowns)
+            wiki_files = await self.llm.generate_wiki(markdowns)
         else:
             changed_files = set(changes["added"]) | set(changes["modified"])
             changed_markdowns = {f: markdowns[f] for f in changed_files}
 
             if not changed_markdowns:
                 logger.info("No content changes, skipping LLM call")
-                wiki = self.storage.get_json(_WIKI_KEY) or dict(_DEFAULT_WIKI)
+                wiki_files = self._load_current_wiki_files()
             else:
-                current_wiki = self.storage.get_json(_WIKI_KEY) or dict(_DEFAULT_WIKI)
-                wiki = await self.llm.update_wiki(current_wiki, changed_markdowns, changes)
+                current_files = self._load_current_wiki_files()
+                wiki_files = await self.llm.update_wiki(current_files, changed_markdowns, changes)
 
-        # Step 4: ensure metadata timestamps, then persist
-        wiki.setdefault("metadata", {})["updated_at"] = datetime.now().isoformat()
-        self.storage.put_json(_WIKI_KEY, wiki)
+        # Step 4: persist wiki files and snapshot
+        for path, content in wiki_files.items():
+            self.storage.put_file(path, content)
         self.storage.put_json(_SNAPSHOT_KEY, markdowns)
 
-        logger.info(f"Processing complete for {timestamp}")
+        logger.info(f"Processing complete for {timestamp}: saved {len(wiki_files)} wiki files")
 
         return ProcessResponse(
             status="success",
             message=f"Wiki {'generated' if is_first_run else 'updated'} successfully",
-            wiki_url="minio://wiki-data/wiki.json",
+            wiki_url="minio://wiki-data/",
             changes_summary=changes,
             timestamp=datetime.now().isoformat(),
         )
