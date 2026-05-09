@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 
 import httpx
@@ -15,6 +16,9 @@ class MinimaxClient:
 
     def __init__(self, api_key: str):
         self.api_key = api_key
+        self.mock_mode = os.getenv("MOCK_LLM", "").lower() in ("true", "1", "yes")
+        if self.mock_mode:
+            logger.warning("Running in MOCK mode - LLM calls will return mock responses")
 
     def extract_json(self, content: str) -> dict:
         """Remove <think>...</think> tags and extract JSON from LLM response."""
@@ -29,7 +33,10 @@ class MinimaxClient:
 
     async def _call(self, prompt: str, temperature: float) -> str:
         """Make a single call to the Minimax API and return the assistant message content."""
-        async with httpx.AsyncClient() as client:
+        if self.mock_mode:
+            return self._mock_response(prompt)
+
+        async with httpx.AsyncClient(verify=False) as client:
             response = await client.post(
                 MINIMAX_API_URL,
                 headers={"Authorization": f"Bearer {self.api_key}"},
@@ -43,6 +50,22 @@ class MinimaxClient:
             response.raise_for_status()
             result = response.json()
             return result["choices"][0]["message"]["content"]
+
+    def _mock_response(self, prompt: str) -> str:
+        """Return a mock LLM response for testing."""
+        return json.dumps({
+            "apis": {
+                "users": {
+                    "GET /users": {"method": "GET", "path": "/users", "description": "List all users"},
+                    "POST /users": {"method": "POST", "path": "/users", "description": "Create user"},
+                },
+                "orders": {
+                    "GET /orders": {"method": "GET", "path": "/orders", "description": "List orders"},
+                    "POST /orders": {"method": "POST", "path": "/orders", "description": "Create order"},
+                }
+            },
+            "metadata": {"version": "1.0", "modules": ["users", "orders"]}
+        })
 
     async def generate_wiki(self, markdowns: dict) -> dict:
         """
