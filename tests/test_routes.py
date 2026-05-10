@@ -19,6 +19,10 @@ def test_health_returns_200_with_expected_keys():
     body = resp.json()
     assert "status" in body
     assert "minio_connected" in body
+    # New fields
+    assert "llm_configured" in body
+    assert "llm_provider" in body
+    # Backward-compat alias
     assert "minimax_accessible" in body
 
 
