@@ -15,9 +15,10 @@ class GroqProvider(OpenAICompatibleProvider):
     """Groq ultra-fast inference — OpenAI-compatible API."""
 
     def __init__(self, config: LLMConfig):
-        # Force base_url to Groq regardless of what was passed
-        config.base_url = _GROQ_BASE_URL
         super().__init__(config)
+        # Force base_url to Groq regardless of what was passed, without
+        # mutating the caller's config object
+        self.base_url = _GROQ_BASE_URL
 
     def get_model_info(self):
         info = super().get_model_info()

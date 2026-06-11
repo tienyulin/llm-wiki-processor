@@ -1,5 +1,5 @@
 from typing import Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 class ProcessRequest(BaseModel):
@@ -9,6 +9,13 @@ class ProcessRequest(BaseModel):
     trigger_info: dict
     source_app: Optional[str] = None  # e.g., "app-inventory"
     source_version: Optional[str] = None  # git commit sha or version tag
+
+    @field_validator("markdowns")
+    @classmethod
+    def markdowns_must_not_be_empty(cls, v: dict[str, str]) -> dict[str, str]:
+        if not v:
+            raise ValueError("markdowns must contain at least one file")
+        return v
 
 
 class ProcessResponse(BaseModel):

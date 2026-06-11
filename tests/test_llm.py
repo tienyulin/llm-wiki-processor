@@ -73,21 +73,17 @@ def minimax_mock():
     return MinimaxProvider(config)
 
 
-def test_minimax_mock_generate_wiki(minimax_mock):
-    result = asyncio.get_event_loop().run_until_complete(
-        minimax_mock.generate_wiki({"api.md": "# Test API\nGET /health"})
-    )
+async def test_minimax_mock_generate_wiki(minimax_mock):
+    result = await minimax_mock.generate_wiki({"api.md": "# Test API\nGET /health"})
     assert isinstance(result, dict)
     assert "apis" in result
     assert "metadata" in result
 
 
-def test_minimax_mock_update_wiki(minimax_mock):
+async def test_minimax_mock_update_wiki(minimax_mock):
     current = {"apis": {}, "metadata": {}}
     markdowns = {"api.md": "# Test\nGET /health"}
-    result = asyncio.get_event_loop().run_until_complete(
-        minimax_mock.update_wiki(current, markdowns, {"added": ["api.md"]})
-    )
+    result = await minimax_mock.update_wiki(current, markdowns, {"added": ["api.md"]})
     assert isinstance(result, dict)
     assert "apis" in result
 

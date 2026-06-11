@@ -35,7 +35,7 @@ class OpenAICompatibleProvider(LLMProvider):
 
     def _headers(self) -> dict:
         h = {"Content-Type": "application/json"}
-        if self.config.api_key and self.config.api_key not in ("not-required", ""):
+        if self.config.api_key:
             h["Authorization"] = f"Bearer {self.config.api_key}"
         return h
 

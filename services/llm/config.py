@@ -77,7 +77,7 @@ def load_from_env() -> LLMConfig:
 
     return LLMConfig(
         provider=provider,
-        api_key=api_key or "not-required",
+        api_key=api_key,
         model=model,
         temperature=temperature,
         max_tokens=max_tokens,

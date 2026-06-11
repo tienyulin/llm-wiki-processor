@@ -1,5 +1,4 @@
 import logging
-import os
 
 from fastapi import APIRouter, HTTPException
 
@@ -81,10 +80,9 @@ async def health():
         logger.error(f"Minio health check failed: {e}")
 
     try:
-        # Check API key is present (actual connectivity check is deferred)
-        llm_ok = bool(_llm_config.api_key and _llm_config.api_key not in ("", "not-required", "dummy-key"))
-        if os.getenv("MOCK_LLM", "false").lower() == "true":
-            llm_ok = True  # mock mode is always "ok"
+        # Local config check only — validate_config() would make a live LLM
+        # API call, and /health is polled.
+        llm_ok = llm.is_configured()
     except Exception as e:
         logger.error(f"LLM health check failed: {e}")
 

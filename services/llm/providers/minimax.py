@@ -72,7 +72,7 @@ class MinimaxProvider(LLMProvider):
                 raise APIException(f"Minimax API error: {e}")
 
     async def validate_config(self) -> bool:
-        if self.mock_mode or not self.config.api_key or self.config.api_key == "not-required":
+        if self.mock_mode or not self.config.api_key:
             logger.warning("MinimaxProvider: skipping validation (mock/no-key mode)")
             return True
         try:

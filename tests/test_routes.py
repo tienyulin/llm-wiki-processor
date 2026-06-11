@@ -72,3 +72,15 @@ def test_process_returns_200_and_response_body():
     assert body["status"] == "success"
     assert body["wiki_url"] == "minio://wiki-data/wiki.json"
     assert "api.md" in body["changes_summary"]["added"]
+
+
+def test_process_rejects_empty_markdowns():
+    resp = client.post(
+        "/process",
+        json={
+            "markdowns": {},
+            "timestamp": "2024-01-01T00:00:00",
+            "trigger_info": {"branch": "main"},
+        },
+    )
+    assert resp.status_code == 422
