@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 
 os.environ.setdefault("MOCK_LLM", "true")
 os.environ.setdefault("LLM_API_KEY", "test-key")
+os.environ.setdefault("MOCK_EMBEDDINGS", "true")
 
 # Stub the Minio SDK class so MinioStorage() never opens a connection.
 # Tests that exercise storage behavior patch `api.routes.storage` directly.

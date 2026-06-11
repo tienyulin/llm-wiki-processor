@@ -36,6 +36,9 @@ class HealthResponse(BaseModel):
     minio_connected: bool
     llm_configured: bool
     llm_provider: str = "unknown"
+    # Optional PG+pgvector index layer (False when PG_DSN is unset)
+    vector_index_connected: bool = False
+    embeddings_configured: bool = False
     # Backward-compat alias (mirrors llm_configured)
     minimax_accessible: Optional[bool] = None
 

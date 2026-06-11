@@ -1,0 +1,391 @@
+"""PGVectorStore: read-write Postgres+pgvector index for the wiki.
+
+Postgres here is a derived, rebuildable serving index over wiki.json (MinIO
+stays the source of truth). The processor syncs it best-effort after a
+successful CAS write; any failure is logged, never propagated into the wiki
+pipeline. PG_DSN empty => the whole layer is disabled (pg_store_from_env()
+returns None), matching the PROCESSOR_API_KEY dev-mode convention.
+
+This module owns the table DDL (ensure_schema). db/init/ only creates the
+pgvector extension on first boot of the compose primary; that keeps exactly
+one executable copy of the schema, usable against any PG with pgvector.
+
+Vectors are passed as pgvector text literals ("[1,2,3]") cast with ::vector,
+so no per-connection type registration is needed.
+"""
+
+import asyncio
+import logging
+import os
+from datetime import datetime
+
+from psycopg.types.json import Jsonb
+from psycopg_pool import AsyncConnectionPool
+
+from services.llm.exceptions import ConfigurationException
+
+logger = logging.getLogger(__name__)
+
+_TABLES_SQL = """
+CREATE TABLE IF NOT EXISTS api_entries (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    module          TEXT        NOT NULL,
+    api_key         TEXT        NOT NULL,
+    source_app      TEXT        NOT NULL,
+    source_version  TEXT,
+    description     TEXT        NOT NULL DEFAULT '',
+    detail          JSONB       NOT NULL,
+    embed_text      TEXT        NOT NULL,
+    embedding       vector({dim}),
+    embedding_model TEXT,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (module, api_key)
+);
+CREATE INDEX IF NOT EXISTS idx_api_entries_source_app ON api_entries (source_app);
+CREATE INDEX IF NOT EXISTS idx_api_entries_module     ON api_entries (module);
+CREATE TABLE IF NOT EXISTS index_state (
+    key        TEXT PRIMARY KEY,
+    value      JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS app_sync (
+    source_app     TEXT PRIMARY KEY,
+    synced_at      TIMESTAMPTZ NOT NULL,
+    source_version TEXT
+);
+"""
+
+# Search indexes, separate from the tables: rebuild() drops and recreates
+# them around its bulk insert — building HNSW once over the full data set is
+# far cheaper than maintaining it row by row for tens of thousands of rows.
+_SEARCH_INDEXES_SQL = """
+CREATE INDEX IF NOT EXISTS idx_api_entries_embedding
+    ON api_entries USING hnsw (embedding vector_cosine_ops);
+-- Trigram GIN makes ILIKE '%term%' indexed; embed_text concatenates
+-- module | api_key | endpoint | description | params, so keyword search
+-- over this one column covers the same haystack as the old wiki scan.
+CREATE INDEX IF NOT EXISTS idx_api_entries_embed_text_trgm
+    ON api_entries USING gin (embed_text gin_trgm_ops);
+"""
+
+_DROP_SEARCH_INDEXES_SQL = """
+DROP INDEX IF EXISTS idx_api_entries_embedding;
+DROP INDEX IF EXISTS idx_api_entries_embed_text_trgm;
+"""
+
+_INSERT_ENTRY_SQL = """
+INSERT INTO api_entries
+    (module, api_key, source_app, source_version, description, detail,
+     embed_text, embedding, embedding_model, updated_at)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s::vector, %s, now())
+ON CONFLICT (module, api_key) DO UPDATE SET
+    source_app      = EXCLUDED.source_app,
+    source_version  = EXCLUDED.source_version,
+    description     = EXCLUDED.description,
+    detail          = EXCLUDED.detail,
+    embed_text      = EXCLUDED.embed_text,
+    embedding       = EXCLUDED.embedding,
+    embedding_model = EXCLUDED.embedding_model,
+    updated_at      = now()
+"""
+
+
+def to_vector_literal(vec) -> str | None:
+    """Format a vector as a pgvector text literal; None passes through as NULL."""
+    if vec is None:
+        return None
+    return "[" + ",".join(repr(float(c)) for c in vec) + "]"
+
+
+class PGVectorStore:
+    """Read-write access to the api_entries index (wiki-processor side)."""
+
+    def __init__(self, dsn: str, min_size: int = 1, max_size: int = 10, dim: int = 1536):
+        self.dim = dim
+        self._schema_ready = False
+        # open=False + lazy aopen(): routes.py builds singletons at import
+        # time, before any event loop exists.
+        self._pool = AsyncConnectionPool(
+            conninfo=dsn,
+            min_size=min_size,
+            max_size=max_size,
+            open=False,
+            timeout=10,
+            kwargs={"connect_timeout": 5},
+            check=AsyncConnectionPool.check_connection,
+        )
+        self._open_lock = asyncio.Lock()
+        self._opened = False
+        self._schema_lock = asyncio.Lock()
+
+    async def _ensure_open(self):
+        if self._opened:
+            return
+        async with self._open_lock:
+            if not self._opened:
+                # wait=False: an unreachable PG must not block startup; each
+                # operation then fails fast on its own connection attempt.
+                await self._pool.open(wait=False)
+                self._opened = True
+
+    async def aclose(self):
+        if self._opened:
+            await self._pool.close()
+            self._opened = False
+
+    # ------------------------------------------------------------------
+    # Schema
+    # ------------------------------------------------------------------
+
+    async def ensure_schema(self, dim: int):
+        """Create extension/tables idempotently; refuse on dimension mismatch.
+
+        Changing EMBEDDING_DIM (or the embedding model's size) makes stored
+        vectors incomparable — the fix is documented in
+        docs/troubleshooting.md: drop the tables and POST /admin/reindex.
+        """
+        await self._ensure_open()
+        async with self._pool.connection() as conn:
+            for extension in ("vector", "pg_trgm"):
+                try:
+                    await conn.execute(f"CREATE EXTENSION IF NOT EXISTS {extension}")
+                except Exception:
+                    # Not superuser — fine if the extension already exists.
+                    await conn.rollback()
+                    cur = await conn.execute(
+                        "SELECT 1 FROM pg_extension WHERE extname = %s", (extension,)
+                    )
+                    if await cur.fetchone() is None:
+                        raise ConfigurationException(
+                            f"The {extension} extension is not installed and this "
+                            f"role cannot create it; run db/init/01-extension.sql "
+                            f"as superuser"
+                        )
+
+            existing_dim = await self._embedding_dim(conn)
+            if existing_dim is not None and existing_dim != dim:
+                raise ConfigurationException(
+                    f"api_entries.embedding is vector({existing_dim}) but "
+                    f"EMBEDDING_DIM={dim}; old and new vectors are incomparable. "
+                    f"Drop the api_entries table and POST /admin/reindex."
+                )
+            if existing_dim is None:
+                await conn.execute(_TABLES_SQL.format(dim=int(dim)))
+            await conn.execute(_SEARCH_INDEXES_SQL)
+            await conn.commit()
+
+    async def ensure_schema_once(self):
+        """ensure_schema(self.dim), cached after the first success.
+
+        Locked: a concurrent burst (100 simultaneous /process) must run the
+        DDL exactly once, not as a thundering herd of CREATE INDEX checks."""
+        if self._schema_ready:
+            return
+        async with self._schema_lock:
+            if not self._schema_ready:
+                await self.ensure_schema(self.dim)
+                self._schema_ready = True
+
+    async def _embedding_dim(self, conn) -> int | None:
+        """Dimension of the existing embedding column, or None if no table.
+
+        pgvector stores the dimension directly as the column's atttypmod."""
+        cur = await conn.execute(
+            """
+            SELECT a.atttypmod
+            FROM pg_attribute a
+            JOIN pg_class c ON c.oid = a.attrelid
+            WHERE c.relname = 'api_entries' AND a.attname = 'embedding'
+            """
+        )
+        row = await cur.fetchone()
+        return row[0] if row else None
+
+    # ------------------------------------------------------------------
+    # Writes
+    # ------------------------------------------------------------------
+
+    async def replace_app_entries(
+        self,
+        source_app: str,
+        source_version: str,
+        rows: list[dict],
+        synced_at: datetime,
+    ) -> bool:
+        """Atomically replace one app's entries (mirrors _merge_app_entries).
+
+        rows: [{module, api_key, description, detail, embed_text,
+                embedding (list|None), embedding_model}, ...]
+
+        Returns False when a newer sync for this app already landed (the
+        app_sync guard) — protects against out-of-order replays from
+        concurrent processor replicas.
+        """
+        await self._ensure_open()
+        async with self._pool.connection() as conn:
+            async with conn.transaction():
+                # The index is rebuildable from wiki.json, so losing the last
+                # few commits in a crash is repairable — skipping the WAL
+                # fsync per app sync is a safe ~10x latency win under bursts.
+                await conn.execute("SET LOCAL synchronous_commit = off")
+                cur = await conn.execute(
+                    """
+                    INSERT INTO app_sync (source_app, synced_at, source_version)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (source_app) DO UPDATE SET
+                        synced_at = EXCLUDED.synced_at,
+                        source_version = EXCLUDED.source_version
+                    WHERE app_sync.synced_at < EXCLUDED.synced_at
+                    RETURNING source_app
+                    """,
+                    (source_app, synced_at, source_version),
+                )
+                if await cur.fetchone() is None:
+                    logger.warning(
+                        f"PG sync for {source_app} at {synced_at} is stale, skipping"
+                    )
+                    return False
+
+                await conn.execute(
+                    "DELETE FROM api_entries WHERE source_app = %s", (source_app,)
+                )
+                await self._insert_rows(conn, source_app, source_version, rows)
+                await self._set_state(
+                    conn,
+                    "last_sync",
+                    {
+                        "source_app": source_app,
+                        "synced_at": synced_at.isoformat(),
+                        "entries": len(rows),
+                    },
+                )
+        return True
+
+    async def rebuild(self, apps: dict[str, list[dict]], versions: dict[str, str]) -> int:
+        """Full rebuild from wiki.json (bootstrap on existing data, drift repair).
+
+        apps: {source_app: rows}; wipes everything first, in one transaction.
+        """
+        await self._ensure_open()
+        now = datetime.now().astimezone()
+        total = 0
+        async with self._pool.connection() as conn:
+            async with conn.transaction():
+                await conn.execute("SET LOCAL synchronous_commit = off")
+                # Bulk path: drop search indexes, insert everything, rebuild
+                # them once at the end (row-by-row HNSW maintenance dominates
+                # rebuild time past a few thousand entries).
+                await conn.execute(_DROP_SEARCH_INDEXES_SQL)
+                await conn.execute("TRUNCATE api_entries, app_sync")
+                for source_app, rows in apps.items():
+                    version = versions.get(source_app, "unknown")
+                    await conn.execute(
+                        "INSERT INTO app_sync (source_app, synced_at, source_version) "
+                        "VALUES (%s, %s, %s)",
+                        (source_app, now, version),
+                    )
+                    await self._insert_rows(conn, source_app, version, rows)
+                    total += len(rows)
+                await self._set_state(
+                    conn,
+                    "last_rebuild",
+                    {"at": now.isoformat(), "apps": len(apps), "entries": total},
+                )
+                await conn.execute(_SEARCH_INDEXES_SQL)
+        return total
+
+    async def _insert_rows(self, conn, source_app: str, source_version: str, rows: list[dict]):
+        if not rows:
+            return
+        async with conn.cursor() as cur:
+            await cur.executemany(
+                _INSERT_ENTRY_SQL,
+                [
+                    (
+                        r["module"],
+                        r["api_key"],
+                        source_app,
+                        source_version,
+                        r.get("description", ""),
+                        Jsonb(r["detail"]),
+                        r["embed_text"],
+                        to_vector_literal(r.get("embedding")),
+                        r.get("embedding_model"),
+                    )
+                    for r in rows
+                ],
+            )
+
+    async def _set_state(self, conn, key: str, value: dict):
+        await conn.execute(
+            """
+            INSERT INTO index_state (key, value, updated_at) VALUES (%s, %s, now())
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+            """,
+            (key, Jsonb(value)),
+        )
+
+    # ------------------------------------------------------------------
+    # Reads (health / verification)
+    # ------------------------------------------------------------------
+
+    async def available(self) -> bool:
+        try:
+            await self._ensure_open()
+            async with self._pool.connection() as conn:
+                await conn.execute("SELECT 1")
+            return True
+        except Exception as e:
+            logger.debug(f"PG availability probe failed: {e}")
+            return False
+
+    async def count_entries(self) -> tuple[int, int]:
+        """(total entries, entries with an embedding)."""
+        await self._ensure_open()
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT count(*), count(embedding) FROM api_entries"
+            )
+            total, embedded = await cur.fetchone()
+            return total, embedded
+
+    async def semantic_search(self, query_vec: list[float], top_k: int = 10) -> list[dict]:
+        """ANN top-k by cosine distance (used by tests and verification)."""
+        await self._ensure_open()
+        literal = to_vector_literal(query_vec)
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                """
+                SELECT module, api_key, description, source_app,
+                       1 - (embedding <=> %s::vector) AS score
+                FROM api_entries
+                WHERE embedding IS NOT NULL
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+                """,
+                (literal, literal, top_k),
+            )
+            return [
+                {
+                    "module": m,
+                    "api_key": k,
+                    "description": d,
+                    "source_app": s,
+                    "score": float(score),
+                }
+                for m, k, d, s, score in await cur.fetchall()
+            ]
+
+
+def pg_store_from_env() -> PGVectorStore | None:
+    """Build the store from PG_DSN, or None when the layer is disabled."""
+    dsn = os.getenv("PG_DSN", "").strip()
+    if not dsn:
+        return None
+    return PGVectorStore(
+        dsn,
+        min_size=int(os.getenv("PG_POOL_MIN", "1")),
+        max_size=int(os.getenv("PG_POOL_MAX", "10")),
+        dim=int(os.getenv("EMBEDDING_DIM", "1536")),
+    )

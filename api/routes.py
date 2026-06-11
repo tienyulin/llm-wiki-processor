@@ -5,9 +5,11 @@ import secrets
 from fastapi import APIRouter, Depends, Header, HTTPException
 
 from models.schemas import HealthResponse, ProcessRequest, ProcessResponse
+from services.embeddings import EmbeddingClient, load_embedding_env
 from services.llm import LLMProvider, LLMProviderFactory, load_from_env
 from services.processor import WikiProcessor
 from storage.minio_client import MinioStorage
+from storage.pg_store import pg_store_from_env
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +43,23 @@ _llm_config = load_from_env()
 llm: LLMProvider = LLMProviderFactory.create(_llm_config)
 logger.info(f"LLM provider initialized: {_llm_config.provider} / {_llm_config.model}")
 
-processor = WikiProcessor(storage=storage, llm=llm)
+_embed_config = load_embedding_env()
+embedder = EmbeddingClient(_embed_config) if _embed_config.is_enabled() else None
+vector_store = pg_store_from_env()
+if vector_store is None:
+    logger.warning(
+        "PG_DSN not set — vector index DISABLED (dev mode). Search and reads "
+        "fall back to wiki.json scans; set PG_DSN to enable semantic search."
+    )
+else:
+    logger.info(
+        f"Vector index enabled (dim={vector_store.dim}, "
+        f"embeddings={'on' if embedder else 'off — relational sync only'})"
+    )
+
+processor = WikiProcessor(
+    storage=storage, llm=llm, embedder=embedder, vector_store=vector_store
+)
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +86,24 @@ async def process(request: ProcessRequest):
     except Exception as e:
         logger.error(f"Unexpected error during processing: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Processing error: {e}")
+
+
+@router.post("/admin/reindex", dependencies=[Depends(require_api_key)])
+async def reindex():
+    """Rebuild the PG vector index from wiki.json.
+
+    Bootstrap path for enabling PG on an existing wiki, and the repair path
+    for any wiki<->PG drift (e.g. PG was down during submissions)."""
+    if processor.vector_store is None:
+        raise HTTPException(status_code=503, detail="Vector index disabled: PG_DSN is not configured")
+    try:
+        result = await processor.reindex()
+        return {"status": "ok", **result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Reindex failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Reindex failed: {e}")
 
 
 @router.get("/status")
@@ -106,9 +142,18 @@ async def health():
     except Exception as e:
         logger.error(f"LLM health check failed: {e}")
 
+    vector_ok = False
+    if processor.vector_store is not None:
+        try:
+            vector_ok = await processor.vector_store.available()
+        except Exception as e:
+            logger.error(f"Vector index health check failed: {e}")
+
     return HealthResponse(
         status="ok" if minio_ok else "degraded",
         minio_connected=minio_ok,
         llm_configured=llm_ok,
         llm_provider=_llm_config.provider,
+        vector_index_connected=vector_ok,
+        embeddings_configured=embedder is not None,
     )

@@ -24,6 +24,9 @@ def test_health_returns_200_with_expected_keys():
     assert "llm_provider" in body
     # Backward-compat alias
     assert "minimax_accessible" in body
+    # Vector-index layer (disabled in tests: no PG_DSN)
+    assert body["vector_index_connected"] is False
+    assert body["embeddings_configured"] is True  # MOCK_EMBEDDINGS=true in conftest
 
 
 def test_status_returns_expected_shape():
@@ -112,6 +115,29 @@ def test_process_accepts_valid_api_key(monkeypatch):
         mock_processor.process = AsyncMock(return_value=fake_response)
         resp = client.post("/process", json=_PAYLOAD, headers={"X-API-Key": "secret-key"})
     assert resp.status_code == 200
+
+
+def test_reindex_503_when_pg_disabled(monkeypatch):
+    monkeypatch.delenv("PROCESSOR_API_KEY", raising=False)
+    resp = client.post("/admin/reindex")
+    assert resp.status_code == 503
+    assert "PG_DSN" in resp.json()["detail"]
+
+
+def test_reindex_requires_api_key(monkeypatch):
+    monkeypatch.setenv("PROCESSOR_API_KEY", "secret-key")
+    assert client.post("/admin/reindex").status_code == 401
+
+
+def test_reindex_runs_when_pg_enabled():
+    with patch("api.routes.processor") as mock_processor:
+        mock_processor.vector_store = MagicMock()  # not None => enabled
+        mock_processor.reindex = AsyncMock(
+            return_value={"apps": 2, "entries": 5, "embedded": 5}
+        )
+        resp = client.post("/admin/reindex")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok", "apps": 2, "entries": 5, "embedded": 5}
 
 
 def test_process_open_when_auth_disabled(monkeypatch):
