@@ -1,9 +1,9 @@
 import asyncio
-import json
 import logging
 import os
-import re
+import random
 import time
+import uuid
 from datetime import datetime
 
 import httpx
@@ -16,27 +16,44 @@ logger = logging.getLogger(__name__)
 
 _WIKI_KEY = "wiki.json"
 _SNAPSHOT_KEY = "markdowns_snapshot.json"
-_AUDIT_LOG_KEY = "wiki-audit-log.jsonl"
-_METADATA_KEY = "wiki-metadata.json"
+_APP_SNAPSHOT_PREFIX = "snapshots/"
+_AUDIT_PREFIX = "audit/"
+_SCHEMA_VERSION = 2
+_CAS_MAX_RETRIES = 5
+
+_SYSTEM_APP = "system"
+
+
 def _default_wiki() -> dict:
-    """Fresh default wiki with a creation timestamp evaluated at call time."""
+    """Fresh canonical (v2) wiki with a creation timestamp evaluated at call time."""
     return {
+        "schema_version": _SCHEMA_VERSION,
         "apis": {},
         "metadata": {"version": "1.0", "created_at": datetime.now().isoformat()},
     }
 
 
 class WikiProcessor:
-    """Orchestrates the full wiki-processing pipeline with app-level incremental updates."""
+    """Orchestrates the wiki-processing pipeline with app-level incremental updates.
+
+    Concurrency model (multi-replica safe): the LLM call runs unlocked and
+    fully concurrent; the merge+write happens in a bounded optimistic CAS loop
+    using MinIO conditional writes (ETag If-Match). See
+    docs/architecture/concurrency.md.
+    """
 
     def __init__(self, storage: MinioStorage, llm: LLMProvider):
         self.storage = storage
         self.llm = llm
-        # Serializes the read-modify-write pipeline in process(). All apps share
-        # a single wiki.json, so concurrent updates would lose writes across the
-        # awaited LLM call. Process-local only — multi-replica deployments need
-        # conditional writes (see docs/architecture/concurrency.md).
-        self._lock = asyncio.Lock()
+        # Serializes only Phase 2 (merge + conditional write, ~ms) within this
+        # process; without it an N-way in-process burst would exhaust the CAS
+        # retry budget (one winner per round). Cross-replica conflicts are
+        # still handled by the CAS loop itself.
+        self._write_lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------
+    # Pure helpers
+    # ------------------------------------------------------------------
 
     def detect_changes(self, old: dict, new: dict) -> dict:
         """
@@ -56,74 +73,105 @@ class WikiProcessor:
             "deleted": sorted(deleted),
         }
 
-    def _extract_source_app(self, content: str) -> str:
-        """Extract source_app from YAML frontmatter."""
-        if not content.startswith("---"):
-            return "unknown"
+    def _normalize_wiki(self, wiki: dict) -> dict:
+        """Lazy migration to the v2 schema.
 
-        end_idx = content.find("---", 3)
-        if end_idx == -1:
-            return "unknown"
-
-        frontmatter = content[3:end_idx]
-        match = re.search(r'source_app:\s*["\']*(\w+[-\w]*)', frontmatter)
-        return match.group(1) if match else "unknown"
-
-    def _get_app_files(self, wiki: dict, source_app: str) -> dict[str, str]:
-        """Get all files in wiki contributed by a specific source app."""
-        app_files = {}
-        for path, content in wiki.items():
-            if isinstance(content, str) and self._extract_source_app(content) == source_app:
-                app_files[path] = content
-        return app_files
-
-    async def _update_wiki_for_app(
-        self,
-        current_wiki: dict,
-        source_app: str,
-        source_version: str,
-        markdowns: dict,
-    ) -> dict[str, str]:
+        Pre-v2 wikis mixed two shapes: structured {"apis": ...} and a flat
+        file map {"doc.md": "<markdown>"}. The structured part is preserved;
+        legacy file-map entries are dropped (their apps repopulate on their
+        next submission) — see docs/troubleshooting.md.
         """
-        App-level incremental update: only regenerate files for this source_app.
-        Preserve files from other apps.
-        """
-        logger.info(f"Performing app-level update for {source_app}")
+        if wiki.get("schema_version") == _SCHEMA_VERSION:
+            return wiki
 
-        # Identify old files from this app
-        old_app_files = self._get_app_files(current_wiki, source_app)
-
-        # Call LLM to process only this app's markdown
-        app_wiki_files = await self.llm.update_wiki(
-            current_files=old_app_files,
-            changed_markdowns=markdowns,
-            changes=f"Updated {source_app} documentation (version: {source_version})",
-        )
-
-        # Merge: keep files from other apps (and non-file entries such as
-        # "apis"/"metadata" dicts), update files from this app
-        merged_wiki = {
-            **{path: content for path, content in current_wiki.items()
-               if not (isinstance(content, str)
-                       and self._extract_source_app(content) == source_app)},
-            **app_wiki_files,
+        apis = wiki.get("apis")
+        metadata = wiki.get("metadata")
+        dropped = [k for k, v in wiki.items() if isinstance(v, str)]
+        if dropped:
+            logger.warning(
+                f"Migrating wiki to schema v{_SCHEMA_VERSION}: dropping "
+                f"{len(dropped)} legacy file-map entries: {dropped[:5]}..."
+            )
+        return {
+            "schema_version": _SCHEMA_VERSION,
+            "apis": apis if isinstance(apis, dict) else {},
+            "metadata": metadata if isinstance(metadata, dict) else {},
         }
 
-        return merged_wiki
+    def _stamp(self, apis: dict, source_app: str, source_version: str) -> dict:
+        """Stamp provenance onto every API entry.
 
-    def _log_audit(self, source_app: str, files_count: int, status: str, files_updated: list):
-        """Append entry to audit log."""
-        log_entry = {
+        The processor owns provenance — LLM output is never trusted for
+        source_app/source_version.
+        """
+        stamped: dict = {}
+        for module, endpoints in (apis or {}).items():
+            if not isinstance(endpoints, dict):
+                continue
+            for api_key, detail in endpoints.items():
+                entry = dict(detail) if isinstance(detail, dict) else {"description": str(detail)}
+                entry["source_app"] = source_app
+                entry["source_version"] = source_version
+                stamped.setdefault(module, {})[api_key] = entry
+        return stamped
+
+    def _app_entries(self, wiki: dict, source_app: str) -> dict:
+        """Extract one app's current entries: {module: {api_key: {...}}}."""
+        out: dict = {}
+        for module, endpoints in wiki.get("apis", {}).items():
+            if not isinstance(endpoints, dict):
+                continue
+            selected = {
+                k: v for k, v in endpoints.items()
+                if isinstance(v, dict) and v.get("source_app") == source_app
+            }
+            if selected:
+                out[module] = selected
+        return out
+
+    def _merge_app_entries(self, wiki: dict, source_app: str, new_apis: dict) -> dict:
+        """Replace one app's entries in the wiki; other apps' entries are kept.
+
+        Returns a new wiki dict (no mutation of the input)."""
+        merged_apis: dict = {}
+        for module, endpoints in wiki.get("apis", {}).items():
+            if not isinstance(endpoints, dict):
+                continue
+            kept = {
+                k: v for k, v in endpoints.items()
+                if not (isinstance(v, dict) and v.get("source_app") == source_app)
+            }
+            if kept:
+                merged_apis[module] = kept
+        for module, endpoints in new_apis.items():
+            merged_apis.setdefault(module, {}).update(endpoints)
+
+        return {
+            "schema_version": _SCHEMA_VERSION,
+            "apis": merged_apis,
+            "metadata": {**wiki.get("metadata", {}), "updated_at": datetime.now().isoformat()},
+        }
+
+    # ------------------------------------------------------------------
+    # Side channels (audit, cache invalidation)
+    # ------------------------------------------------------------------
+
+    async def _log_audit(self, source_app: str, files_count: int, status: str, files_updated: list):
+        """Write one audit entry as its own object (append-only, no contention).
+
+        Keys sort chronologically: audit/{iso-ts}-{uuid8}.json."""
+        entry = {
             "timestamp": datetime.now().isoformat(),
             "source_app": source_app,
             "files_count": files_count,
             "status": status,
             "files_updated": files_updated,
         }
-        # Append to NDJSON audit log
-        existing = self.storage.get_file(_AUDIT_LOG_KEY) or ""
-        new_content = existing.rstrip() + "\n" + json.dumps(log_entry) if existing else json.dumps(log_entry)
-        self.storage.put_file(_AUDIT_LOG_KEY, new_content)
+        key = f"{_AUDIT_PREFIX}{entry['timestamp']}-{uuid.uuid4().hex[:8]}.json"
+        try:
+            await self.storage.aput_json(key, entry)
+        except Exception as e:
+            logger.error(f"Audit write failed ({key}): {e}")
 
     async def _notify_cache_invalidation(self, source_app: str = None):
         """Tell mcp-server to drop its cached wiki after a successful update.
@@ -144,6 +192,10 @@ class WikiProcessor:
         except Exception as e:
             logger.warning(f"mcp-server cache invalidation failed: {e}")
 
+    # ------------------------------------------------------------------
+    # Main pipeline
+    # ------------------------------------------------------------------
+
     async def process(
         self,
         markdowns: dict,
@@ -152,96 +204,106 @@ class WikiProcessor:
         source_version: str = None,
     ) -> ProcessResponse:
         """
-        Full pipeline supporting app-level updates:
-        1. Detect if first run or app-level update.
-        2. Call LLM (full wiki or app-specific).
-        3. Save updated wiki + snapshot.
-        4. Log to audit trail.
+        Two-phase pipeline:
+        1. (concurrent) Read wiki, call LLM to produce this app's API entries.
+        2. (CAS loop) Re-read + merge + conditional write until it sticks.
         """
         start_time = time.time()
-        processing_time_ms = 0
-        validation_errors = []
-        files_updated = []
+        app = source_app or _SYSTEM_APP
+        version = source_version or "unknown"
+        snapshot_key = (
+            f"{_APP_SNAPSHOT_PREFIX}{app}.json" if source_app else _SNAPSHOT_KEY
+        )
 
-        # The snapshot/wiki read and write are separated by an awaited LLM
-        # call; without the lock, concurrent requests overwrite each other.
-        async with self._lock:
-            try:
-                # Step 1: retrieve previous snapshot and wiki
-                old_snapshot = self.storage.get_json(_SNAPSHOT_KEY) or {}
-                current_wiki = self.storage.get_json(_WIKI_KEY) or _default_wiki()
-                is_first_run = len(old_snapshot) == 0
+        try:
+            # ---- Phase 1: read + LLM (no lock, fully concurrent) ----
+            raw, etag = await self.storage.aget_json_with_etag(_WIKI_KEY)
+            is_first_run = raw is None
+            wiki = _default_wiki() if is_first_run else self._normalize_wiki(raw)
 
-                # Step 2: detect changes
-                if is_first_run:
-                    logger.info("First run detected - generating complete wiki")
-                    changes = {"added": sorted(markdowns.keys()), "modified": [], "deleted": []}
-                    wiki = await self.llm.generate_wiki(markdowns)
-                    files_updated = list(wiki.keys())
-                elif source_app:
-                    # App-level incremental update
-                    logger.info(f"App-level update for {source_app}")
-                    changes = {"app": source_app, "version": source_version}
-                    wiki = await self._update_wiki_for_app(
-                        current_wiki=current_wiki,
-                        source_app=source_app,
-                        source_version=source_version or "unknown",
-                        markdowns=markdowns,
-                    )
-                    files_updated = [path for path in wiki.keys()
-                                     if isinstance(wiki[path], str)
-                                     and self._extract_source_app(wiki[path]) == source_app]
-                else:
-                    # Full incremental update
-                    changes = self.detect_changes(old_snapshot, markdowns)
-                    logger.info(f"Changes detected: {changes}")
+            old_snapshot = await self.storage.aget_json(snapshot_key) or {}
+            changes = self.detect_changes(old_snapshot, markdowns)
 
-                    changed_files = set(changes["added"]) | set(changes["modified"])
-                    changed_markdowns = {f: markdowns[f] for f in changed_files}
-
-                    if not changed_markdowns:
-                        logger.info("No content changes, skipping LLM call")
-                        wiki = current_wiki
-                    else:
-                        wiki = await self.llm.update_wiki(current_wiki, changed_markdowns, changes)
-
-                    files_updated = list(changed_files)
-
-                # Step 3: persist
-                wiki.setdefault("metadata", {})["updated_at"] = datetime.now().isoformat()
-                self.storage.put_json(_WIKI_KEY, wiki)
-                self.storage.put_json(_SNAPSHOT_KEY, markdowns)
-
-                # Step 4: log audit + notify mcp-server cache
-                self._log_audit(source_app or "system", len(markdowns), "success", files_updated)
-                await self._notify_cache_invalidation(source_app)
-
+            if not any(changes.values()):
+                logger.info(f"No content changes for {app}, skipping LLM call")
                 processing_time_ms = int((time.time() - start_time) * 1000)
-                logger.info(f"Processing complete for {timestamp} in {processing_time_ms}ms")
-
                 return ProcessResponse(
                     status="success",
-                    message=f"Wiki {'generated' if is_first_run else 'updated'} successfully",
+                    message="No changes detected, wiki unchanged",
                     wiki_url="minio://wiki-data/wiki.json",
                     changes_summary=changes,
                     timestamp=datetime.now().isoformat(),
                     source_app=source_app,
-                    files_updated=files_updated,
-                    validation_errors=validation_errors,
+                    files_updated=[],
                     processing_time_ms=processing_time_ms,
                 )
 
-            except Exception as e:
-                processing_time_ms = int((time.time() - start_time) * 1000)
-                error_msg = f"Error processing wiki: {str(e)}"
-                logger.error(error_msg)
-                self._log_audit(source_app or "system", len(markdowns), "failed", [])
-
-                return ProcessResponse(
-                    status="failed",
-                    message=error_msg,
-                    timestamp=datetime.now().isoformat(),
-                    source_app=source_app,
-                    validation_errors=[{"error": str(e)}],
-                    processing_time_ms=processing_time_ms,
+            if is_first_run:
+                logger.info("First run detected - generating complete wiki")
+                generated = await self.llm.generate_wiki(markdowns)
+            else:
+                logger.info(f"App-level update for {app}")
+                current_entries = self._app_entries(wiki, app)
+                generated = await self.llm.update_wiki(
+                    current_apis=current_entries,
+                    changed_markdowns=markdowns,
+                    changes=changes,
                 )
+
+            new_apis = self._stamp(generated.get("apis", {}), app, version)
+            files_updated = sorted(
+                api_key for endpoints in new_apis.values() for api_key in endpoints
+            )
+
+            # ---- Phase 2: merge + conditional write (bounded CAS loop) ----
+            async with self._write_lock:
+                for attempt in range(_CAS_MAX_RETRIES):
+                    merged = self._merge_app_entries(wiki, app, new_apis)
+                    if etag is None:
+                        ok = await self.storage.aput_json_if_absent(_WIKI_KEY, merged)
+                    else:
+                        ok = await self.storage.aput_json_if_match(_WIKI_KEY, merged, etag)
+                    if ok:
+                        break
+                    logger.info(f"CAS conflict for {app} (attempt {attempt + 1}), retrying")
+                    await asyncio.sleep(random.uniform(0.01, 0.05) * (attempt + 1))
+                    raw, etag = await self.storage.aget_json_with_etag(_WIKI_KEY)
+                    wiki = self._normalize_wiki(raw) if raw is not None else _default_wiki()
+                else:
+                    raise RuntimeError(
+                        f"Wiki write failed after {_CAS_MAX_RETRIES} CAS attempts for {app}"
+                    )
+
+            await self.storage.aput_json(snapshot_key, markdowns)
+            await self._log_audit(app, len(markdowns), "success", files_updated)
+            await self._notify_cache_invalidation(source_app)
+
+            processing_time_ms = int((time.time() - start_time) * 1000)
+            logger.info(f"Processing complete for {timestamp} in {processing_time_ms}ms")
+
+            return ProcessResponse(
+                status="success",
+                message=f"Wiki {'generated' if is_first_run else 'updated'} successfully",
+                wiki_url="minio://wiki-data/wiki.json",
+                changes_summary=changes,
+                timestamp=datetime.now().isoformat(),
+                source_app=source_app,
+                files_updated=files_updated,
+                validation_errors=[],
+                processing_time_ms=processing_time_ms,
+            )
+
+        except Exception as e:
+            processing_time_ms = int((time.time() - start_time) * 1000)
+            error_msg = f"Error processing wiki: {str(e)}"
+            logger.error(error_msg)
+            await self._log_audit(app, len(markdowns), "failed", [])
+
+            return ProcessResponse(
+                status="failed",
+                message=error_msg,
+                timestamp=datetime.now().isoformat(),
+                source_app=source_app,
+                validation_errors=[{"error": str(e)}],
+                processing_time_ms=processing_time_ms,
+            )

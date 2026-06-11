@@ -84,3 +84,42 @@ def test_process_rejects_empty_markdowns():
         },
     )
     assert resp.status_code == 422
+
+
+_PAYLOAD = {
+    "markdowns": {"api.md": "# API docs"},
+    "timestamp": "2024-01-01T00:00:00",
+    "trigger_info": {"branch": "main"},
+}
+
+
+def test_process_requires_api_key_when_configured(monkeypatch):
+    monkeypatch.setenv("PROCESSOR_API_KEY", "secret-key")
+
+    # Missing header
+    assert client.post("/process", json=_PAYLOAD).status_code == 401
+    # Wrong key
+    resp = client.post("/process", json=_PAYLOAD, headers={"X-API-Key": "wrong"})
+    assert resp.status_code == 401
+
+
+def test_process_accepts_valid_api_key(monkeypatch):
+    monkeypatch.setenv("PROCESSOR_API_KEY", "secret-key")
+    fake_response = ProcessResponse(
+        status="success", message="ok", timestamp="2024-01-01T00:00:00",
+    )
+    with patch("api.routes.processor") as mock_processor:
+        mock_processor.process = AsyncMock(return_value=fake_response)
+        resp = client.post("/process", json=_PAYLOAD, headers={"X-API-Key": "secret-key"})
+    assert resp.status_code == 200
+
+
+def test_process_open_when_auth_disabled(monkeypatch):
+    monkeypatch.delenv("PROCESSOR_API_KEY", raising=False)
+    fake_response = ProcessResponse(
+        status="success", message="ok", timestamp="2024-01-01T00:00:00",
+    )
+    with patch("api.routes.processor") as mock_processor:
+        mock_processor.process = AsyncMock(return_value=fake_response)
+        resp = client.post("/process", json=_PAYLOAD)
+    assert resp.status_code == 200

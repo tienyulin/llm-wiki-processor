@@ -1,6 +1,8 @@
 import logging
+import os
+import secrets
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 
 from models.schemas import HealthResponse, ProcessRequest, ProcessResponse
 from services.llm import LLMProvider, LLMProviderFactory, load_from_env
@@ -10,6 +12,24 @@ from storage.minio_client import MinioStorage
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+if not os.getenv("PROCESSOR_API_KEY"):
+    logger.warning(
+        "PROCESSOR_API_KEY not set — /process is UNAUTHENTICATED (dev mode). "
+        "Set it before exposing this service beyond localhost."
+    )
+
+
+async def require_api_key(x_api_key: str = Header(default="")):
+    """Reject /process calls without a valid X-API-Key when auth is enabled.
+
+    Read at request time (not import time) so tests can toggle the env var.
+    """
+    expected = os.getenv("PROCESSOR_API_KEY")
+    if not expected:
+        return  # auth disabled (dev mode)
+    if not secrets.compare_digest(x_api_key, expected):
+        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
 
 # ---------------------------------------------------------------------------
 # Singletons (created once at import time)
@@ -28,7 +48,7 @@ processor = WikiProcessor(storage=storage, llm=llm)
 # Routes
 # ---------------------------------------------------------------------------
 
-@router.post("/process", response_model=ProcessResponse)
+@router.post("/process", response_model=ProcessResponse, dependencies=[Depends(require_api_key)])
 async def process(request: ProcessRequest):
     """Process markdown files and update the wiki.
 
