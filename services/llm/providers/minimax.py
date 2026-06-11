@@ -42,7 +42,7 @@ class MinimaxProvider(LLMProvider):
 
         temp = temperature if temperature is not None else self.config.temperature
 
-        async with httpx.AsyncClient(verify=False) as client:
+        async with httpx.AsyncClient() as client:
             try:
                 response = await client.post(
                     _API_URL,
@@ -75,7 +75,7 @@ class MinimaxProvider(LLMProvider):
             logger.warning("MinimaxProvider: skipping validation (mock/no-key mode)")
             return True
         try:
-            async with httpx.AsyncClient(verify=False) as client:
+            async with httpx.AsyncClient() as client:
                 response = await client.post(
                     _API_URL,
                     headers={"Authorization": f"Bearer {self.config.api_key}"},
