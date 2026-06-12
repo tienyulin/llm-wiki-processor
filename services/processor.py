@@ -11,8 +11,8 @@ import httpx
 from models.schemas import ProcessResponse
 from services.embeddings import EmbeddingClient, entry_to_text
 from services.llm import LLMProvider
-from storage.minio_client import MinioStorage
-from storage.pg_store import PGVectorStore
+from repository.minio_client import MinioStorage
+from repository.pg_store import PGVectorStore
 
 logger = logging.getLogger(__name__)
 

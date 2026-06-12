@@ -16,7 +16,7 @@ import pytest
 
 from services.embeddings import mock_embed
 from services.llm.exceptions import ConfigurationException
-from storage.pg_store import PGVectorStore, to_vector_literal
+from repository.pg_store import PGVectorStore, to_vector_literal
 
 _DSN = os.getenv("PG_TEST_DSN", "postgresql://postgres:pg@localhost:5432/wiki")
 _DIM = 32

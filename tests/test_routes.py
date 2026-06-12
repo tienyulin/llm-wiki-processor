@@ -1,19 +1,41 @@
-"""Tests for FastAPI routes using TestClient."""
-from unittest.mock import AsyncMock, MagicMock, patch
+"""Tests for FastAPI routes using TestClient.
+
+Singletons are provided lazily via core.deps; tests inject mocks with
+app.dependency_overrides (cleared by the autouse fixture in conftest.py).
+"""
+from contextlib import contextmanager
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
+from core import deps
 from main import app
 from models.schemas import ProcessResponse
 
 client = TestClient(app)
 
 
+@contextmanager
+def override(dep, replacement):
+    app.dependency_overrides[dep] = lambda: replacement
+    try:
+        yield replacement
+    finally:
+        app.dependency_overrides.pop(dep, None)
+
+
+@contextmanager
+def mock_processor_override():
+    mock_processor = MagicMock()
+    with override(deps.get_processor, mock_processor):
+        yield mock_processor
+
+
 def test_health_returns_200_with_expected_keys():
-    with patch("api.routes.storage") as mock_storage:
-        mock_storage.client.bucket_exists.return_value = True
-        mock_storage.bucket = "wiki-data"
+    mock_storage = MagicMock()
+    mock_storage.ping.return_value = True
+    with override(deps.get_storage, mock_storage):
         resp = client.get("/health")
     assert resp.status_code == 200
     body = resp.json()
@@ -36,10 +58,11 @@ def test_status_returns_expected_shape():
     }
     fake_snapshot = {"a.md": "...", "b.md": "..."}
 
-    with patch("api.routes.storage") as mock_storage:
-        mock_storage.get_json.side_effect = lambda key: (
-            fake_wiki if key == "wiki.json" else fake_snapshot
-        )
+    mock_storage = MagicMock()
+    mock_storage.get_json.side_effect = lambda key: (
+        fake_wiki if key == "wiki.json" else fake_snapshot
+    )
+    with override(deps.get_storage, mock_storage):
         resp = client.get("/status")
 
     assert resp.status_code == 200
@@ -59,7 +82,7 @@ def test_process_returns_200_and_response_body():
         timestamp="2024-01-01T00:00:00",
     )
 
-    with patch("api.routes.processor") as mock_processor:
+    with mock_processor_override() as mock_processor:
         mock_processor.process = AsyncMock(return_value=fake_response)
         resp = client.post(
             "/process",
@@ -111,7 +134,7 @@ def test_process_accepts_valid_api_key(monkeypatch):
     fake_response = ProcessResponse(
         status="success", message="ok", timestamp="2024-01-01T00:00:00",
     )
-    with patch("api.routes.processor") as mock_processor:
+    with mock_processor_override() as mock_processor:
         mock_processor.process = AsyncMock(return_value=fake_response)
         resp = client.post("/process", json=_PAYLOAD, headers={"X-API-Key": "secret-key"})
     assert resp.status_code == 200
@@ -130,7 +153,7 @@ def test_reindex_requires_api_key(monkeypatch):
 
 
 def test_reindex_runs_when_pg_enabled():
-    with patch("api.routes.processor") as mock_processor:
+    with mock_processor_override() as mock_processor:
         mock_processor.vector_store = MagicMock()  # not None => enabled
         mock_processor.reindex = AsyncMock(
             return_value={"apps": 2, "entries": 5, "embedded": 5}
@@ -145,7 +168,7 @@ def test_process_open_when_auth_disabled(monkeypatch):
     fake_response = ProcessResponse(
         status="success", message="ok", timestamp="2024-01-01T00:00:00",
     )
-    with patch("api.routes.processor") as mock_processor:
+    with mock_processor_override() as mock_processor:
         mock_processor.process = AsyncMock(return_value=fake_response)
         resp = client.post("/process", json=_PAYLOAD)
     assert resp.status_code == 200

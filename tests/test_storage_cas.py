@@ -12,7 +12,7 @@ import uuid
 import pytest
 from minio import Minio
 
-from storage.minio_client import MinioStorage
+from repository.minio_client import MinioStorage
 
 _ENDPOINT = os.getenv("MINIO_ENDPOINT", "localhost:9000")
 
@@ -33,7 +33,7 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture
 def storage():
-    # conftest stubs the Minio class inside storage.minio_client for hermetic
+    # conftest stubs the Minio class inside repository.minio_client for hermetic
     # unit tests; rebuild a real client for these CAS tests.
     s = MinioStorage()
     s.client = Minio(

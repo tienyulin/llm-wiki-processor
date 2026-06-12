@@ -50,6 +50,14 @@ class MinioStorage:
             logger.error(f"✗ Could not ensure bucket existence: {e}", exc_info=True)
             raise
 
+    def ping(self) -> bool:
+        """Connectivity probe for health checks; never raises."""
+        try:
+            return bool(self.client.bucket_exists(self.bucket))
+        except Exception as e:
+            logger.error(f"Minio ping failed: {e}")
+            return False
+
     def get_json(self, key: str) -> dict | None:
         """Retrieve a JSON object from Minio. Returns None if key does not exist."""
         try:
