@@ -331,7 +331,7 @@ class WikiProcessor:
 
             if is_first_run:
                 logger.info("First run detected - generating complete wiki")
-                generated = await self.llm.generate_wiki(markdowns)
+                generated = await self.llm.generate_wiki(markdowns, source_app=source_app)
             else:
                 logger.info(f"App-level update for {app}")
                 current_entries = self._app_entries(wiki, app)
@@ -339,6 +339,7 @@ class WikiProcessor:
                     current_apis=current_entries,
                     changed_markdowns=markdowns,
                     changes=changes,
+                    source_app=source_app,
                 )
 
             new_apis = self._stamp(generated.get("apis", {}), app, version)

@@ -82,28 +82,45 @@ class LLMProvider(ABC):
         try:
             return json.loads(content)
         except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", content, re.DOTALL)
-            if match:
-                return json.loads(match.group())
+            # LLMs may wrap the JSON in code fences or append trailing text or a
+            # second object (e.g. MiniMax-M2.7/M3). Decode the first complete
+            # JSON object starting at the first '{' and ignore anything after it.
+            start = content.find("{")
+            if start != -1:
+                obj, _ = json.JSONDecoder().raw_decode(content[start:])
+                return obj
             raise
 
     @staticmethod
-    def _mock_apis_from_markdowns(markdowns: Dict[str, str]) -> dict:
+    def _mock_apis_from_markdowns(
+        markdowns: Dict[str, str], source_app: Optional[str] = None
+    ) -> dict:
         """Derive deterministic API entries from the input markdowns.
 
         Mock responses must reflect the input (not canned data) so that
         integration and stress tests can verify each app's data actually
-        reaches the wiki. One module per file; every file yields at least
-        one entry.
+        reaches the wiki. Every file yields at least one entry.
+
+        Module key matches what a real LLM produces for the same input: the
+        pushing application's identity (``source_app``) when known, else the
+        file stem. This keeps mock and real extraction producing identical
+        module keys (e.g. "flashback-api").
         """
         apis: dict = {}
         for filename, content in markdowns.items():
-            module = filename.rsplit(".", 1)[0]
-            for suffix in ("_api", "_arch", "-api"):
-                module = module.removesuffix(suffix)
+            if source_app:
+                module = source_app
+            else:
+                module = filename.rsplit(".", 1)[0]
+                for suffix in ("_api", "_arch", "-api"):
+                    module = module.removesuffix(suffix)
             h1 = _H1_RE.search(content or "")
             description = h1.group(1).strip() if h1 else filename
-            endpoints = _ENDPOINT_RE.findall(content or "")
+            # Scan for endpoints outside fenced code blocks so example/comment
+            # lines (e.g. "bash ... # POST /process") aren't harvested as real
+            # endpoints — this matches how a real LLM reads the document.
+            scan_text = re.sub(r"```.*?```", "", content or "", flags=re.DOTALL)
+            endpoints = _ENDPOINT_RE.findall(scan_text)
             module_apis = apis.setdefault(module, {})
             if endpoints:
                 for method, path in endpoints:
@@ -121,15 +138,21 @@ class LLMProvider(ABC):
                 }
         return apis
 
-    async def generate_wiki(self, markdowns: Dict[str, str]) -> dict:
+    async def generate_wiki(
+        self, markdowns: Dict[str, str], source_app: Optional[str] = None
+    ) -> dict:
         """Generate a full structured wiki from markdown files.
 
         Returns {"apis": {module: {api_key: {...}}}, "metadata": {...}}.
         Provenance (source_app/source_version) is stamped by the processor,
-        not requested from the model.
+        not requested from the model. ``source_app`` is forwarded to mock
+        extraction so mock module keys match real-LLM output.
         """
         if self._mock_mode():
-            return {"apis": self._mock_apis_from_markdowns(markdowns), "metadata": {}}
+            return {
+                "apis": self._mock_apis_from_markdowns(markdowns, source_app),
+                "metadata": {},
+            }
 
         combined = "\n\n".join(f"## File: {fn}\n{c}" for fn, c in markdowns.items())
         prompt = (
@@ -145,19 +168,29 @@ class LLMProvider(ABC):
         content = await self.generate(prompt, temperature=0.3)
         return self.extract_json(content)
 
-    async def update_wiki(self, current_apis: dict, changed_markdowns: Dict[str, str], changes) -> dict:
+    async def update_wiki(
+        self,
+        current_apis: dict,
+        changed_markdowns: Dict[str, str],
+        changes,
+        source_app: Optional[str] = None,
+    ) -> dict:
         """Regenerate one application's API entries.
 
         Args:
             current_apis: the app's existing entries, {module: {api_key: {...}}}
             changed_markdowns: the app's new/modified markdown files
             changes: change summary (dict or str), included in the prompt
+            source_app: pushing app identity, used as the mock module key so
+                mock output matches real-LLM extraction.
 
         Returns {"apis": {module: {api_key: {...}}}} containing ONLY this
         app's entries — the processor merges them into the shared wiki.
         """
         if self._mock_mode():
-            return {"apis": self._mock_apis_from_markdowns(changed_markdowns)}
+            return {
+                "apis": self._mock_apis_from_markdowns(changed_markdowns, source_app)
+            }
 
         changed_content = "\n\n".join(f"## File: {fn}\n{c}" for fn, c in changed_markdowns.items())
         current_summary = json.dumps(current_apis, ensure_ascii=False, indent=2)[:2000]

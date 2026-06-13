@@ -69,8 +69,12 @@ def load_from_env() -> LLMConfig:
     base_url = os.getenv("LLM_BASE_URL")
     timeout_seconds = int(os.getenv("LLM_TIMEOUT", "60"))
 
+    # Mock mode performs deterministic extraction without calling any provider,
+    # so no API key is required (matches the documented key-free mock setup).
+    mock_mode = os.getenv("MOCK_LLM", "false").lower() == "true"
+
     # Require API key for providers other than openai-compatible (local may not need one)
-    if not api_key and provider != "openai-compatible":
+    if not api_key and provider != "openai-compatible" and not mock_mode:
         raise ConfigurationException(
             f"API key required. Set LLM_API_KEY (or MINIMAX_API_KEY) for provider: {provider}"
         )
