@@ -39,13 +39,26 @@ class MinioStorage:
         self._ensure_bucket()
 
     def _ensure_bucket(self) -> None:
-        """Ensure bucket exists, create if not."""
+        """Ensure bucket exists, create if not.
+
+        bucket_exists()+make_bucket() is a check-then-act with an inherent
+        race, and MinIO can return a stale 404 from bucket_exists() on the
+        first boot of a fresh volume — make_bucket() then fails with
+        BucketAlreadyOwnedByYou. Treat "already there" as success so startup
+        is idempotent.
+        """
         try:
             if not self.client.bucket_exists(self.bucket):
                 self.client.make_bucket(self.bucket)
                 logger.info(f"✓ Created bucket: {self.bucket}")
             else:
                 logger.info(f"✓ Bucket exists: {self.bucket}")
+        except S3Error as e:
+            if e.code in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
+                logger.info(f"✓ Bucket already present: {self.bucket}")
+                return
+            logger.error(f"✗ Could not ensure bucket existence: {e}", exc_info=True)
+            raise
         except Exception as e:
             logger.error(f"✗ Could not ensure bucket existence: {e}", exc_info=True)
             raise

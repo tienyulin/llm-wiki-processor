@@ -15,6 +15,10 @@ import pytest
 os.environ.setdefault("MOCK_LLM", "true")
 os.environ.setdefault("LLM_API_KEY", "test-key")
 os.environ.setdefault("MOCK_EMBEDDINGS", "true")
+# PG is now enabled by default in docker-compose, so an in-container `pytest`
+# inherits PG_DSN. Force it off here for hermetic unit tests — the PG-enabled
+# paths are exercised via dependency overrides, not ambient env.
+os.environ["PG_DSN"] = ""
 
 # Stub the Minio SDK class so MinioStorage() never opens a connection.
 import repository.minio_client as _minio_client  # noqa: E402
