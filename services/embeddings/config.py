@@ -21,6 +21,11 @@ class EmbeddingConfig:
     batch_size: int = 64
     timeout_seconds: int = 30
     mock_mode: bool = False
+    # Send {"dimensions": dim} in the request. Needed for models whose native
+    # output exceeds the wanted size (e.g. Gemini gemini-embedding-001 defaults
+    # to 3072, over pgvector's 2000-dim index limit) or to truncate OpenAI
+    # text-embedding-3-*. Off by default: older models reject the parameter.
+    send_dimensions: bool = False
 
     def __post_init__(self):
         if self.dim <= 0:
@@ -45,6 +50,9 @@ def load_embedding_env() -> EmbeddingConfig:
         EMBEDDING_DIM         - Vector dimension (default: 1536, must match DDL)
         EMBEDDING_BATCH_SIZE  - Texts per request (default: 64)
         EMBEDDING_TIMEOUT     - Request timeout in seconds (default: 30)
+        EMBEDDING_SEND_DIMENSIONS - "true" = send {"dimensions": EMBEDDING_DIM}
+                                    in the request (needed for Gemini
+                                    gemini-embedding-001; truncates OpenAI -3-*)
         MOCK_EMBEDDINGS       - "true" = deterministic local vectors, no network
     """
     return EmbeddingConfig(
@@ -55,4 +63,5 @@ def load_embedding_env() -> EmbeddingConfig:
         batch_size=int(os.getenv("EMBEDDING_BATCH_SIZE", "64")),
         timeout_seconds=int(os.getenv("EMBEDDING_TIMEOUT", "30")),
         mock_mode=os.getenv("MOCK_EMBEDDINGS", "false").lower() == "true",
+        send_dimensions=os.getenv("EMBEDDING_SEND_DIMENSIONS", "false").lower() == "true",
     )

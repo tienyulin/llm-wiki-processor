@@ -64,11 +64,14 @@ class EmbeddingClient:
 
     async def _embed_chunk(self, client: httpx.AsyncClient, chunk: list[str]) -> list[list[float]]:
         url = f"{self.config.base_url}/v1/embeddings"
+        body = {"model": self.config.model, "input": chunk}
+        if self.config.send_dimensions:
+            body["dimensions"] = self.config.dim
         try:
             response = await client.post(
                 url,
                 headers=self._headers(),
-                json={"model": self.config.model, "input": chunk},
+                json=body,
             )
             if response.status_code == 401:
                 raise AuthenticationException("Invalid API key for embeddings endpoint")
@@ -77,8 +80,11 @@ class EmbeddingClient:
             response.raise_for_status()
 
             data = response.json()["data"]
-            # The API may return items out of order; "index" is authoritative.
-            ordered = sorted(data, key=lambda item: item["index"])
+            # The API may return items out of order; "index" is authoritative
+            # when present. Some OpenAI-compatible servers (e.g. Gemini's compat
+            # endpoint) omit "index" and return items in request order — fall
+            # back to that.
+            ordered = sorted(data, key=lambda item: item.get("index", 0))
             vectors = [item["embedding"] for item in ordered]
         except (AuthenticationException, RateLimitException):
             raise
