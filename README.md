@@ -27,6 +27,16 @@ curl localhost:8001/health
 ```
 Run without the vector index: `PG_DSN= docker compose up -d --build minio wiki-processor`.
 
+## Develop in a Dev Container
+This repo ships a [`.devcontainer/`](.devcontainer/). In VS Code / Cursor:
+**Reopen in Container** — it builds this service + its deps (minio, pg), mounts the
+source live at `/app`, and gives you an isolated Python env (no host pollution,
+no clash with the other services). Inside the container:
+```bash
+python -m pytest         # run the tests
+python main.py           # run the service (:8001); edits reflect live
+```
+
 ## Push an app's docs
 ```bash
 curl -X POST localhost:8001/process -H 'Content-Type: application/json' -d '{

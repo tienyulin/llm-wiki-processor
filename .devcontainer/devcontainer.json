@@ -1,0 +1,26 @@
+{
+  "name": "wiki-processor",
+  "dockerComposeFile": ["../docker-compose.yml", "docker-compose.dev.yml"],
+  "service": "wiki-processor",
+  "workspaceFolder": "/app",
+  "mounts": [
+    "source=${localWorkspaceFolder},target=/app,type=bind,consistency=cached"
+  ],
+  "shutdownAction": "stopCompose",
+  "forwardPorts": [8001, 9000, 9001, 5432],
+  "postCreateCommand": "pip install -r requirements.txt",
+  "remoteEnv": {
+    "MOCK_LLM": "true",
+    "MOCK_EMBEDDINGS": "true"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python", "ms-python.vscode-pylance"],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "python.testing.pytestEnabled": true,
+        "python.testing.pytestArgs": ["."]
+      }
+    }
+  }
+}
