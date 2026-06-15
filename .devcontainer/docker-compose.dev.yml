@@ -1,0 +1,10 @@
+# Dev-container override for the standalone stack (docker-compose.yml).
+# Keeps the service container alive so VS Code can attach and you run the app
+# yourself; the source is bind-mounted live by devcontainer.json (mounts).
+# Deps (minio, pg) come from the base compose. Used by devcontainer.json.
+services:
+  wiki-processor:
+    command: sleep infinity
+    environment:
+      MOCK_LLM: ${MOCK_LLM:-true}
+      MOCK_EMBEDDINGS: ${MOCK_EMBEDDINGS:-true}
