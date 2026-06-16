@@ -1,50 +1,15 @@
-# Standalone wiki-processor stack: the service + its dependencies (MinIO, and
-# Postgres/pgvector for the optional index). Run from this directory:
+# wiki-processor — attaches to the SHARED infra (llm-wiki-infra: minio + pg on
+# the external docker network `llm-wiki-net`). This lets every service run at
+# once, sharing one MinIO + Postgres, with no infra port clash.
 #
-#   cp .env.example .env        # fill in keys (or keep MOCK_LLM=true)
+# Start the shared infra FIRST (once):
+#   git clone https://github.com/tienyulin/llm-wiki-infra   # if you don't have it
+#   (cd ../llm-wiki-infra && docker compose up -d)
+# Then:
+#   cp .env.example .env        # keep MOCK_LLM=true for a no-key run
 #   docker compose up -d --build
 #   curl localhost:8001/health
-#
-# Run WITHOUT the vector index:  PG_DSN= docker compose up -d --build minio wiki-processor
 services:
-  minio:
-    image: minio/minio:latest
-    container_name: wp-minio
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
-    command: minio server /data --console-address ":9001"
-    volumes:
-      - minio_data:/data
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
-    networks: [wp-net]
-
-  pg:
-    image: pgvector/pgvector:pg16
-    container_name: wp-pg
-    ports:
-      - "5432:5432"
-    environment:
-      POSTGRES_USER: ${PG_USER:-wiki}
-      POSTGRES_PASSWORD: ${PG_PASSWORD:-wikipass}
-      POSTGRES_DB: ${PG_DATABASE:-wiki}
-    volumes:
-      - pg_data:/var/lib/postgresql/data
-      - ./db/init:/docker-entrypoint-initdb.d:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-wiki} -d ${PG_DATABASE:-wiki}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks: [wp-net]
-
   wiki-processor:
     build:
       context: .
@@ -65,7 +30,7 @@ services:
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
       MINIO_BUCKET: ${MINIO_BUCKET:-wiki-data}
       PROCESSOR_API_KEY: ${PROCESSOR_API_KEY:-}
-      MCP_SERVER_URL: ${MCP_SERVER_URL:-}
+      MCP_SERVER_URL: ${MCP_SERVER_URL:-http://mcp-server:8002}
       PG_DSN: ${PG_DSN:-postgresql://wiki:wikipass@pg:5432/wiki}
       EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
@@ -73,16 +38,11 @@ services:
       EMBEDDING_DIM: ${EMBEDDING_DIM:-1536}
       EMBEDDING_SEND_DIMENSIONS: ${EMBEDDING_SEND_DIMENSIONS:-false}
       MOCK_EMBEDDINGS: ${MOCK_EMBEDDINGS:-true}
-    depends_on:
-      minio:
-        condition: service_healthy
-    networks: [wp-net]
+    networks: [llm-wiki-net]
     command: python main.py
 
-volumes:
-  minio_data:
-  pg_data:
-
+# Shared network owned by llm-wiki-infra. Start that stack first, or this fails
+# with "network llm-wiki-net not found".
 networks:
-  wp-net:
-    driver: bridge
+  llm-wiki-net:
+    external: true

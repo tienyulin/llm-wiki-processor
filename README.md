@@ -19,19 +19,25 @@ POST /process ──> LLM extraction ──> MinIO wiki.json (CAS, source of tru
 - `repository/` — `minio_client.py`, `pg_store.py`
 - `core/` — config + dependency injection
 
-## Quickstart (standalone)
+## Quickstart
+Uses the **shared infra** ([llm-wiki-infra](https://github.com/tienyulin/llm-wiki-infra):
+one MinIO + Postgres on the `llm-wiki-net` network) so this service can run
+alongside the others without port clashes. Start the infra once, then this:
 ```bash
+# 1) shared infra (once, from a sibling clone of llm-wiki-infra)
+(cd ../llm-wiki-infra && docker compose up -d)
+# 2) this service
 cp .env.example .env          # keep MOCK_LLM=true for a no-key run
-docker compose up -d --build  # brings up minio + pg + wiki-processor
+docker compose up -d --build
 curl localhost:8001/health
 ```
-Run without the vector index: `PG_DSN= docker compose up -d --build minio wiki-processor`.
+Run without the vector index: set `PG_DSN=` in `.env`.
 
 ## Develop in a Dev Container
-This repo ships a [`.devcontainer/`](.devcontainer/). In VS Code / Cursor:
-**Reopen in Container** — it builds this service + its deps (minio, pg), mounts the
-source live at `/app`, and gives you an isolated Python env (no host pollution,
-no clash with the other services). Inside the container:
+This repo ships a [`.devcontainer/`](.devcontainer/). **Start the shared infra
+first** (`cd ../llm-wiki-infra && docker compose up -d`), then in VS Code / Cursor:
+**Reopen in Container** — builds this service, mounts the source live at `/app`,
+isolated Python env, attached to the shared `llm-wiki-net`. Inside the container:
 ```bash
 python -m pytest         # run the tests
 python main.py           # run the service (:8001); edits reflect live
