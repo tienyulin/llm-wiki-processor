@@ -27,3 +27,26 @@ async def reindex(processor: WikiProcessor = Depends(get_processor)):
     except Exception as e:
         logger.error(f"Reindex failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Reindex failed: {e}")
+
+
+@router.post("/admin/recompile", dependencies=[Depends(require_api_key)])
+async def recompile(processor: WikiProcessor = Depends(get_processor)):
+    """Re-run extraction over stored per-app snapshots (no re-ingest).
+
+    Use after an extraction/prompt change to refresh entries from markdown
+    already on record."""
+    try:
+        return {"status": "ok", **await processor.recompile()}
+    except Exception as e:
+        logger.error(f"Recompile failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Recompile failed: {e}")
+
+
+@router.post("/admin/rebuild-concepts", dependencies=[Depends(require_api_key)])
+async def rebuild_concepts(processor: WikiProcessor = Depends(get_processor)):
+    """Cross-app concept synthesis over the whole wiki (writes wiki.concepts)."""
+    try:
+        return {"status": "ok", **await processor.rebuild_concepts()}
+    except Exception as e:
+        logger.error(f"Concept rebuild failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Concept rebuild failed: {e}")

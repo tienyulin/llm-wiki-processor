@@ -59,6 +59,19 @@ the same shape deterministically from the input markdown.
 Rebuild the PG index from MinIO (`{"status":"ok","apps":N,"entries":M,"embedded":M}`).
 Returns 503 when PG is disabled (`PG_DSN` empty).
 
+## `POST /admin/recompile`
+Re-run extraction over stored per-app snapshots without re-ingesting — use after
+an extraction/prompt change. `{"status":"ok","recompiled_apps":[...],"count":N}`.
+
+## `POST /admin/rebuild-concepts`
+Cross-app concept synthesis over the whole wiki; writes `wiki.concepts`. Run after
+a batch of pushes (not per-ingest — it scans the whole wiki).
+`{"status":"ok","concepts":N}`.
+
+`wiki.json` also carries `overviews` (`{app: {text, updated_at}}`, refreshed per
+app ingest) and `concepts` (`{name: {description, related, apps}}`, built by
+`/admin/rebuild-concepts`). Both are served by mcp-server.
+
 ## `GET /health`
 `{"status":"ok","minio_connected":true,"llm_provider":...,"minimax_accessible":...,
   "vector_index_connected":...,"embeddings_configured":...}`

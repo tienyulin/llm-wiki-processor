@@ -127,6 +127,9 @@ class _FakeStorage:
         self._bump(key)
         return True
 
+    async def alist_files(self, prefix=""):
+        return [k for k in self._store if k.startswith(prefix)]
+
 
 # Realistic source docs from two different applications.
 _FLASHBACK_MD = {
@@ -174,3 +177,62 @@ async def test_end_to_end_two_apps_real_case():
     recover = apis["flashback-api"]["POST /recover"]
     assert recover["sources"] == ["flashback.md"]
     assert recover["source_version"] == "v1"
+
+    # Per-app overview (item 5) was synthesized and stored for each app.
+    assert "flashback-api" in wiki["overviews"]
+    assert "recover" in wiki["overviews"]["flashback-api"]["text"].lower()
+
+
+# ---------------------------------------------------------------------------
+# 4. Overview + concepts + recompile through the processor
+# ---------------------------------------------------------------------------
+
+async def test_overview_mock_lists_endpoints():
+    llm = MinimaxProvider(LLMConfig(provider="minimax", api_key="k", model="m"))
+    text = await llm.generate_overview("billing", {"billing": {
+        "GET /invoices": {"description": "list invoices"}}})
+    assert "billing" in text and "invoices" in text
+
+
+async def test_concepts_mock_clusters_cross_app():
+    """Two apps both exposing /recover collapse into one cross-app concept."""
+    llm = MinimaxProvider(LLMConfig(provider="minimax", api_key="k", model="m"))
+    apis = {
+        "app-a": {"POST /recover": {"description": "recover", "source_app": "app-a"}},
+        "app-b": {"GET /recover/{id}": {"description": "status", "source_app": "app-b"}},
+    }
+    concepts = await llm.generate_concepts(apis)
+    assert "recover" in concepts
+    assert sorted(concepts["recover"]["apps"]) == ["app-a", "app-b"]
+    assert len(concepts["recover"]["related"]) == 2
+
+
+async def test_rebuild_concepts_writes_to_wiki():
+    storage = _FakeStorage()
+    llm = MinimaxProvider(LLMConfig(provider="minimax", api_key="k", model="m"))
+    proc = WikiProcessor(storage=storage, llm=llm)
+
+    await proc.process(_FLASHBACK_MD, "t", source_app="flashback-api", source_version="v1")
+    await proc.process(_INVENTORY_MD, "t", source_app="inventory-api", source_version="v2")
+
+    result = await proc.rebuild_concepts()
+    assert result["concepts"] > 0
+    wiki = await storage.aget_json("wiki.json")
+    assert wiki["concepts"], "concepts should be persisted on wiki.json"
+    # rebuild must not clobber existing apis/overviews.
+    assert "flashback-api" in wiki["apis"]
+    assert "flashback-api" in wiki["overviews"]
+
+
+async def test_recompile_refreshes_from_snapshots():
+    storage = _FakeStorage()
+    llm = MinimaxProvider(LLMConfig(provider="minimax", api_key="k", model="m"))
+    proc = WikiProcessor(storage=storage, llm=llm)
+
+    await proc.process(_FLASHBACK_MD, "t", source_app="flashback-api", source_version="v1")
+    result = await proc.recompile()
+
+    assert "flashback-api" in result["recompiled_apps"]
+    wiki = await storage.aget_json("wiki.json")
+    # Entries are back after recompile, stamped with the recompiled version.
+    assert wiki["apis"]["flashback-api"]["POST /recover"]["source_version"] == "recompiled"

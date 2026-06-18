@@ -232,3 +232,80 @@ class LLMProvider(ABC):
         )
         analysis = await self._analyze(changed_content, context=context)
         return await self._generate_from_analysis(changed_content, analysis)
+
+    # ------------------------------------------------------------------
+    # Per-app overview (item 5) and cross-app concepts (item 2).
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _api_lines(apis: dict) -> list[str]:
+        """Flatten {module: {api_key: {description}}} to 'api_key — description'."""
+        lines = []
+        for endpoints in (apis or {}).values():
+            if not isinstance(endpoints, dict):
+                continue
+            for api_key, detail in endpoints.items():
+                desc = detail.get("description", "") if isinstance(detail, dict) else ""
+                lines.append(f"{api_key} — {desc}" if desc else api_key)
+        return lines
+
+    @staticmethod
+    def _concept_token(api_key: str) -> str:
+        """First meaningful path segment of a 'METHOD /a/b' key — the mock's
+        deterministic concept handle (e.g. 'GET /items/{id}' -> 'items')."""
+        parts = api_key.split(None, 1)
+        path = parts[1] if len(parts) > 1 else parts[0]
+        for seg in path.strip("/").split("/"):
+            if seg and not seg.startswith("{"):
+                return seg.lower()
+        return "general"
+
+    async def generate_overview(self, app: str, app_apis: dict) -> str:
+        """One-paragraph synthesis of an app's surface. Mock is deterministic."""
+        lines = self._api_lines(app_apis)
+        if self._mock_mode():
+            return f"{app}: {len(lines)} endpoint(s). " + "; ".join(lines)
+        prompt = (
+            f"Write a concise one-paragraph overview of the '{app}' service based on its "
+            "API endpoints below. State its purpose and main capabilities. Plain text only.\n\n"
+            + "\n".join(lines)
+        )
+        return (await self.generate(prompt, temperature=0.3)).strip()
+
+    async def generate_concepts(self, apis: dict) -> dict:
+        """Cross-app concept synthesis over the WHOLE wiki.
+
+        Returns {concept: {"description", "related": ["module::api_key", ...],
+        "apps": [...]}}. Mock clusters by shared first path segment so the same
+        capability surfacing in two apps becomes one cross-app concept.
+        """
+        if self._mock_mode():
+            concepts: dict = {}
+            for module, endpoints in (apis or {}).items():
+                if not isinstance(endpoints, dict):
+                    continue
+                for api_key, detail in endpoints.items():
+                    token = self._concept_token(api_key)
+                    app = detail.get("source_app", module) if isinstance(detail, dict) else module
+                    c = concepts.setdefault(
+                        token, {"description": f"Endpoints related to '{token}'.", "related": [], "apps": []}
+                    )
+                    c["related"].append(f"{module}::{api_key}")
+                    if app not in c["apps"]:
+                        c["apps"].append(app)
+            return concepts
+
+        catalogue = "\n".join(
+            f"{module}::{api_key} — {detail.get('description', '') if isinstance(detail, dict) else ''}"
+            for module, endpoints in (apis or {}).items() if isinstance(endpoints, dict)
+            for api_key, detail in endpoints.items()
+        )
+        prompt = (
+            "Identify cross-cutting concepts shared across these API endpoints (e.g. "
+            "authentication, pagination, recovery). For each concept list the endpoints "
+            "that implement it. Output ONLY valid JSON:\n"
+            '{"<concept>": {"description": "...", "related": ["<module>::<api_key>", ...], '
+            '"apps": ["<app>", ...]}}\n\n'
+            f"Endpoints:\n{catalogue}"
+        )
+        return self.extract_json(await self.generate(prompt, temperature=0.3))
