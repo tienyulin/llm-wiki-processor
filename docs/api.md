@@ -32,6 +32,26 @@ Auth: send `X-API-Key: $PROCESSOR_API_KEY` when `PROCESSOR_API_KEY` is set
 (empty = open dev mode). Errors are returned as `{"status":"failed", ...}` with
 HTTP 200 (the LLM/embedding failures degrade gracefully).
 
+### API entry shape (in `wiki.json` and `GET /get_api_detail`)
+```json
+{
+  "method": "POST",
+  "path": "/recover",
+  "description": "start a flashback recovery job",
+  "sources": ["flashback.md"],   // markdown file(s) this entry was extracted from
+  "source_app": "flashback-api", // stamped by the processor (LLM output is not trusted for provenance)
+  "source_version": "v1.0"
+}
+```
+`sources` gives per-entry traceability back to the originating markdown; `source_app`
+/`source_version` are stamped by the processor and used for app-level replace/merge.
+
+### Extraction (two-step, real LLM only)
+The LLM path runs a two-step chain of thought: **analyze** the docs (endpoints,
+modules, contradictions, originating file) → **generate** the final JSON grounded in
+that analysis, with a `sources` list per entry. Mock mode (`MOCK_LLM=true`) derives
+the same shape deterministically from the input markdown.
+
 ## `GET /status`
 `{"status":"running","wiki_size":<app count>,"tracked_files":...,"last_updated":...}`
 
