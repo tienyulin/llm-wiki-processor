@@ -14,9 +14,22 @@ Request:
   "timestamp": "2026-06-14T00:00:00",
   "trigger_info": {"source": "ci"},
   "source_app": "my-app",          // app identity; entries stamped + replaced per app
-  "source_version": "git-sha"
+  "source_version": "git-sha",
+  "doc_type": "api"                // "api" | "knowledge"; omit to auto-detect
 }
 ```
+
+**Document types.** `doc_type` selects extraction:
+- `api` — extract endpoints into `wiki.apis` (the default behaviour).
+- `knowledge` — extract a structured entry (title, summary, topics, key_points)
+  from a **prose/reference doc** (e.g. Oracle, a FastAPI how-to) into
+  `wiki.knowledge`, so the wiki holds general knowledge an agent can reason over.
+- Omitted → **auto-detected**: a push containing HTTP endpoints is `api`, else `knowledge`.
+
+Knowledge entries carry the same `sources`/`source_app`/`source_version`
+provenance, and a knowledge doc that *mentions* a concept token (e.g. an Oracle
+"flashback" doc that says "recover") is linked to that concept by
+`/admin/rebuild-concepts` — bridging domains (knowledge ⇄ API).
 Response (200):
 ```json
 {
@@ -69,8 +82,10 @@ a batch of pushes (not per-ingest — it scans the whole wiki).
 `{"status":"ok","concepts":N}`.
 
 `wiki.json` also carries `overviews` (`{app: {text, updated_at}}`, refreshed per
-app ingest) and `concepts` (`{name: {description, related, apps}}`, built by
-`/admin/rebuild-concepts`). Both are served by mcp-server.
+app ingest), `concepts` (`{name: {description, related, apps}}`, built by
+`/admin/rebuild-concepts`), and `knowledge` (`{doc_id: {title, summary, topics,
+key_points, sources, source_app, source_version}}`, from `knowledge` docs). All
+are served by mcp-server.
 
 ## `GET /health`
 `{"status":"ok","minio_connected":true,"llm_provider":...,"minimax_accessible":...,
