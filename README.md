@@ -63,6 +63,7 @@ python -m pytest            # hermetic unit tests (Minio SDK + LLM stubbed)
 Real-MinIO CAS tests and real-PG store tests auto-skip when those servers are unreachable.
 
 ## Docs
+- [Architecture diagrams](docs/architecture/diagram.md) — layering + the two-phase `/process` pipeline
 - [LLM provider abstraction](docs/llm-provider-abstraction.md)
 - [Concurrency model (CAS write pipeline)](docs/concurrency.md)
 - [API reference](docs/api.md)
