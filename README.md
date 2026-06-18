@@ -14,8 +14,8 @@ deployable on its own.
 POST /process ──> LLM extraction ──> MinIO wiki.json (CAS, source of truth)
                                           └─> PG/pgvector index (derived, best-effort)
 ```
-- `api/` — FastAPI routes (`/process`, `/status`, `/admin/reindex`, `/health`)
-- `services/` — `processor.py` (CAS pipeline), `llm/` (7-provider abstraction), `embeddings/`
+- `api/` — FastAPI routes (`/process`, `/status`, `/health`, and `/admin/{reindex,recompile,rebuild-concepts}`)
+- `services/` — `processor.py` (CAS pipeline + concepts/overviews), `llm/` (7-provider abstraction, two-step extraction), `embeddings/`
 - `repository/` — `minio_client.py`, `pg_store.py`
 - `core/` — config + dependency injection
 

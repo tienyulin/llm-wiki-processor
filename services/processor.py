@@ -31,6 +31,8 @@ def _default_wiki() -> dict:
     return {
         "schema_version": _SCHEMA_VERSION,
         "apis": {},
+        "concepts": {},
+        "overviews": {},
         "metadata": {"version": "1.0", "created_at": datetime.now().isoformat()},
     }
 
@@ -141,10 +143,14 @@ class WikiProcessor:
                 out[module] = selected
         return out
 
-    def _merge_app_entries(self, wiki: dict, source_app: str, new_apis: dict) -> dict:
+    def _merge_app_entries(
+        self, wiki: dict, source_app: str, new_apis: dict, overview: str | None = None
+    ) -> dict:
         """Replace one app's entries in the wiki; other apps' entries are kept.
 
-        Returns a new wiki dict (no mutation of the input)."""
+        Returns a new wiki dict (no mutation of the input). Existing `concepts`
+        and `overviews` are carried over so a per-app ingest never clobbers
+        whole-wiki concept synthesis; this app's overview is refreshed."""
         merged_apis: dict = {}
         for module, endpoints in wiki.get("apis", {}).items():
             if not isinstance(endpoints, dict):
@@ -158,9 +164,15 @@ class WikiProcessor:
         for module, endpoints in new_apis.items():
             merged_apis.setdefault(module, {}).update(endpoints)
 
+        overviews = dict(wiki.get("overviews", {}))
+        if overview is not None:
+            overviews[source_app] = {"text": overview, "updated_at": datetime.now().isoformat()}
+
         return {
             "schema_version": _SCHEMA_VERSION,
             "apis": merged_apis,
+            "concepts": wiki.get("concepts", {}),
+            "overviews": overviews,
             "metadata": {**wiki.get("metadata", {}), "updated_at": datetime.now().isoformat()},
         }
 
@@ -239,6 +251,54 @@ class WikiProcessor:
         total = await self.vector_store.rebuild(apps, versions)
         embedded = sum(1 for rows in apps.values() for r in rows if r["embedding"] is not None)
         return {"apps": len(apps), "entries": total, "embedded": embedded}
+
+    async def rebuild_concepts(self) -> dict:
+        """Cross-app concept synthesis over the whole wiki (item 2).
+
+        Runs whole-wiki, like reindex — NOT on every ingest, which would mean a
+        full-wiki LLM scan + shared-blob write per app push (cost + CAS
+        contention). Call after a batch of pushes, or on a schedule.
+        # ponytail: whole-wiki rebuild; switch to incremental concept merge if
+        # the wiki grows past what one LLM call can hold.
+        """
+        raw, etag = await self.storage.aget_json_with_etag(_WIKI_KEY)
+        if raw is None:
+            return {"concepts": 0}
+        wiki = self._normalize_wiki(raw)
+        concepts = await self.llm.generate_concepts(wiki.get("apis", {}))
+        wiki = {**wiki, "concepts": concepts,
+                "metadata": {**wiki.get("metadata", {}), "updated_at": datetime.now().isoformat()}}
+        async with self._write_lock:
+            ok = await self.storage.aput_json_if_match(_WIKI_KEY, wiki, etag)
+            if not ok:
+                raise RuntimeError("Concept rebuild lost a CAS race; retry")
+        await self._notify_cache_invalidation(None)
+        return {"concepts": len(concepts)}
+
+    async def recompile(self) -> dict:
+        """Re-run extraction over stored per-app snapshots without re-ingesting (item 6).
+
+        Use after an extraction/prompt change to refresh entries from the
+        markdown already on record. Each app is reprocessed via the normal
+        process() path (CAS-safe, re-embeds, refreshes its overview)."""
+        keys = [
+            k for k in await self.storage.alist_files(_APP_SNAPSHOT_PREFIX)
+            if k.endswith(".json")
+        ]
+        apps = []
+        for key in keys:
+            app = key[len(_APP_SNAPSHOT_PREFIX):-len(".json")]
+            markdowns = await self.storage.aget_json(key) or {}
+            if not markdowns:
+                continue
+            # Force a full re-extract: drop the snapshot so detect_changes sees
+            # every file as added.
+            await self.storage.aput_json(key, {})
+            await self.process(
+                markdowns, datetime.now().isoformat(), source_app=app, source_version="recompiled"
+            )
+            apps.append(app)
+        return {"recompiled_apps": apps, "count": len(apps)}
 
     # ------------------------------------------------------------------
     # Side channels (audit, cache invalidation)
@@ -347,6 +407,10 @@ class WikiProcessor:
                 api_key for endpoints in new_apis.values() for api_key in endpoints
             )
 
+            # Per-app overview (item 5): scoped to this app, so it folds into the
+            # same CAS write — no cross-app contention, no extra round trip.
+            overview = await self.llm.generate_overview(app, new_apis)
+
             # Still Phase 1 (no lock): embedding is the slow part of index
             # sync, and new_apis is loop-invariant across CAS retries.
             index_rows: list[dict] = []
@@ -357,7 +421,7 @@ class WikiProcessor:
             # ---- Phase 2: merge + conditional write (bounded CAS loop) ----
             async with self._write_lock:
                 for attempt in range(_CAS_MAX_RETRIES):
-                    merged = self._merge_app_entries(wiki, app, new_apis)
+                    merged = self._merge_app_entries(wiki, app, new_apis, overview=overview)
                     if etag is None:
                         ok = await self.storage.aput_json_if_absent(_WIKI_KEY, merged)
                     else:
