@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -25,12 +26,25 @@ _CAS_MAX_RETRIES = 5
 
 _SYSTEM_APP = "system"
 
+# Endpoint signature outside fenced code — used to auto-classify a push as an
+# API spec vs a prose knowledge document when doc_type isn't given.
+_ENDPOINT_RE = re.compile(r"\b(GET|POST|PUT|DELETE|PATCH)\s+/[\w/{}.-]*")
+
+
+def _looks_like_api(markdowns: dict) -> bool:
+    for content in markdowns.values():
+        scan = re.sub(r"```.*?```", "", content or "", flags=re.DOTALL)
+        if _ENDPOINT_RE.search(scan):
+            return True
+    return False
+
 
 def _default_wiki() -> dict:
     """Fresh canonical (v2) wiki with a creation timestamp evaluated at call time."""
     return {
         "schema_version": _SCHEMA_VERSION,
         "apis": {},
+        "knowledge": {},
         "concepts": {},
         "overviews": {},
         "metadata": {"version": "1.0", "created_at": datetime.now().isoformat()},
@@ -144,13 +158,19 @@ class WikiProcessor:
         return out
 
     def _merge_app_entries(
-        self, wiki: dict, source_app: str, new_apis: dict, overview: str | None = None
+        self,
+        wiki: dict,
+        source_app: str,
+        new_apis: dict,
+        overview: str | None = None,
+        new_knowledge: dict | None = None,
     ) -> dict:
         """Replace one app's entries in the wiki; other apps' entries are kept.
 
-        Returns a new wiki dict (no mutation of the input). Existing `concepts`
-        and `overviews` are carried over so a per-app ingest never clobbers
-        whole-wiki concept synthesis; this app's overview is refreshed."""
+        Returns a new wiki dict (no mutation of the input). Existing `concepts`,
+        `overviews`, and the other section (`knowledge` when this push is APIs,
+        and vice-versa) are carried over so a per-app ingest never clobbers
+        them; this app's overview is refreshed."""
         merged_apis: dict = {}
         for module, endpoints in wiki.get("apis", {}).items():
             if not isinstance(endpoints, dict):
@@ -164,6 +184,13 @@ class WikiProcessor:
         for module, endpoints in new_apis.items():
             merged_apis.setdefault(module, {}).update(endpoints)
 
+        # Knowledge: drop this app's old docs, add the new ones; keep other apps'.
+        merged_knowledge = {
+            doc_id: entry for doc_id, entry in wiki.get("knowledge", {}).items()
+            if not (isinstance(entry, dict) and entry.get("source_app") == source_app)
+        }
+        merged_knowledge.update(new_knowledge or {})
+
         overviews = dict(wiki.get("overviews", {}))
         if overview is not None:
             overviews[source_app] = {"text": overview, "updated_at": datetime.now().isoformat()}
@@ -171,10 +198,27 @@ class WikiProcessor:
         return {
             "schema_version": _SCHEMA_VERSION,
             "apis": merged_apis,
+            "knowledge": merged_knowledge,
             "concepts": wiki.get("concepts", {}),
             "overviews": overviews,
             "metadata": {**wiki.get("metadata", {}), "updated_at": datetime.now().isoformat()},
         }
+
+    def _stamp_knowledge(self, knowledge: dict, app: str, version: str, markdowns: dict) -> dict:
+        """Stamp provenance onto each knowledge entry (processor owns provenance).
+        `sources` lists the markdown files this push carried."""
+        sources = sorted(markdowns.keys())
+        stamped: dict = {}
+        for doc_id, entry in (knowledge or {}).items():
+            e = dict(entry) if isinstance(entry, dict) else {"summary": str(entry)}
+            e.setdefault("topics", [])
+            e.setdefault("key_points", [])
+            e["source_app"] = app
+            e["source_version"] = version
+            e["sources"] = sources
+            e["updated_at"] = datetime.now().isoformat()
+            stamped[doc_id] = e
+        return stamped
 
     # ------------------------------------------------------------------
     # Vector index (optional, best-effort — wiki.json stays canonical)
@@ -265,7 +309,9 @@ class WikiProcessor:
         if raw is None:
             return {"concepts": 0}
         wiki = self._normalize_wiki(raw)
-        concepts = await self.llm.generate_concepts(wiki.get("apis", {}))
+        concepts = await self.llm.generate_concepts(
+            wiki.get("apis", {}), knowledge=wiki.get("knowledge", {})
+        )
         wiki = {**wiki, "concepts": concepts,
                 "metadata": {**wiki.get("metadata", {}), "updated_at": datetime.now().isoformat()}}
         async with self._write_lock:
@@ -350,11 +396,16 @@ class WikiProcessor:
         timestamp: str,
         source_app: str = None,
         source_version: str = None,
+        doc_type: str = None,
     ) -> ProcessResponse:
         """
         Two-phase pipeline:
-        1. (concurrent) Read wiki, call LLM to produce this app's API entries.
+        1. (concurrent) Read wiki, call LLM to produce this app's entries
+           (API endpoints, or knowledge entries for prose docs).
         2. (CAS loop) Re-read + merge + conditional write until it sticks.
+
+        doc_type: "api" | "knowledge"; when None, auto-detected (endpoints
+        present -> api, else knowledge).
         """
         start_time = time.time()
         # PG app_sync guard timestamp: request start, so an older request
@@ -389,39 +440,53 @@ class WikiProcessor:
                     processing_time_ms=processing_time_ms,
                 )
 
-            if is_first_run:
-                logger.info("First run detected - generating complete wiki")
-                generated = await self.llm.generate_wiki(markdowns, source_app=source_app)
+            kind = doc_type or ("api" if _looks_like_api(markdowns) else "knowledge")
+
+            new_apis: dict = {}
+            new_knowledge: dict = {}
+            overview: str | None = None
+            index_rows: list[dict] = []
+
+            if kind == "knowledge":
+                logger.info(f"Knowledge ingest for {app}")
+                generated_k = await self.llm.generate_knowledge(markdowns, source_app=app)
+                new_knowledge = self._stamp_knowledge(generated_k, app, version, markdowns)
+                files_updated = sorted(new_knowledge.keys())
             else:
-                logger.info(f"App-level update for {app}")
-                current_entries = self._app_entries(wiki, app)
-                generated = await self.llm.update_wiki(
-                    current_apis=current_entries,
-                    changed_markdowns=markdowns,
-                    changes=changes,
-                    source_app=source_app,
+                if is_first_run:
+                    logger.info("First run detected - generating complete wiki")
+                    generated = await self.llm.generate_wiki(markdowns, source_app=source_app)
+                else:
+                    logger.info(f"App-level update for {app}")
+                    current_entries = self._app_entries(wiki, app)
+                    generated = await self.llm.update_wiki(
+                        current_apis=current_entries,
+                        changed_markdowns=markdowns,
+                        changes=changes,
+                        source_app=source_app,
+                    )
+
+                new_apis = self._stamp(generated.get("apis", {}), app, version)
+                files_updated = sorted(
+                    api_key for endpoints in new_apis.values() for api_key in endpoints
                 )
 
-            new_apis = self._stamp(generated.get("apis", {}), app, version)
-            files_updated = sorted(
-                api_key for endpoints in new_apis.values() for api_key in endpoints
-            )
+                # Per-app overview (item 5): scoped to this app, so it folds into the
+                # same CAS write — no cross-app contention, no extra round trip.
+                overview = await self.llm.generate_overview(app, new_apis)
 
-            # Per-app overview (item 5): scoped to this app, so it folds into the
-            # same CAS write — no cross-app contention, no extra round trip.
-            overview = await self.llm.generate_overview(app, new_apis)
-
-            # Still Phase 1 (no lock): embedding is the slow part of index
-            # sync, and new_apis is loop-invariant across CAS retries.
-            index_rows: list[dict] = []
-            if self.vector_store is not None:
-                index_rows = self._entry_rows(new_apis)
-                await self._embed_rows(app, index_rows)
+                # Still Phase 1 (no lock): embedding is the slow part of index
+                # sync, and new_apis is loop-invariant across CAS retries.
+                if self.vector_store is not None:
+                    index_rows = self._entry_rows(new_apis)
+                    await self._embed_rows(app, index_rows)
 
             # ---- Phase 2: merge + conditional write (bounded CAS loop) ----
             async with self._write_lock:
                 for attempt in range(_CAS_MAX_RETRIES):
-                    merged = self._merge_app_entries(wiki, app, new_apis, overview=overview)
+                    merged = self._merge_app_entries(
+                        wiki, app, new_apis, overview=overview, new_knowledge=new_knowledge
+                    )
                     if etag is None:
                         ok = await self.storage.aput_json_if_absent(_WIKI_KEY, merged)
                     else:

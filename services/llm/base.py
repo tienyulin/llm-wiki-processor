@@ -272,12 +272,14 @@ class LLMProvider(ABC):
         )
         return (await self.generate(prompt, temperature=0.3)).strip()
 
-    async def generate_concepts(self, apis: dict) -> dict:
+    async def generate_concepts(self, apis: dict, knowledge: dict | None = None) -> dict:
         """Cross-app concept synthesis over the WHOLE wiki.
 
-        Returns {concept: {"description", "related": ["module::api_key", ...],
-        "apps": [...]}}. Mock clusters by shared first path segment so the same
-        capability surfacing in two apps becomes one cross-app concept.
+        Returns {concept: {"description", "related": ["module::api_key" |
+        "knowledge::doc_id", ...], "apps": [...]}}. Mock clusters endpoints by
+        shared first path segment, then links knowledge docs that *mention* a
+        concept token — so an Oracle "flashback" doc and a flashback-api
+        `/recover` endpoint land on the same concept (cross-domain reasoning).
         """
         if self._mock_mode():
             concepts: dict = {}
@@ -288,11 +290,25 @@ class LLMProvider(ABC):
                     token = self._concept_token(api_key)
                     app = detail.get("source_app", module) if isinstance(detail, dict) else module
                     c = concepts.setdefault(
-                        token, {"description": f"Endpoints related to '{token}'.", "related": [], "apps": []}
+                        token, {"description": f"Concept '{token}'.", "related": [], "apps": []}
                     )
                     c["related"].append(f"{module}::{api_key}")
                     if app not in c["apps"]:
                         c["apps"].append(app)
+            # Link knowledge docs to any concept token they mention.
+            for doc_id, entry in (knowledge or {}).items():
+                if not isinstance(entry, dict):
+                    continue
+                text = " ".join([
+                    entry.get("title", ""), entry.get("summary", ""),
+                    " ".join(entry.get("topics", [])), " ".join(entry.get("key_points", [])),
+                ]).lower()
+                app = entry.get("source_app", "")
+                for token, c in concepts.items():
+                    if token in text:
+                        c["related"].append(f"knowledge::{doc_id}")
+                        if app and app not in c["apps"]:
+                            c["apps"].append(app)
             return concepts
 
         catalogue = "\n".join(
@@ -307,5 +323,67 @@ class LLMProvider(ABC):
             '{"<concept>": {"description": "...", "related": ["<module>::<api_key>", ...], '
             '"apps": ["<app>", ...]}}\n\n'
             f"Endpoints:\n{catalogue}"
+        )
+        return self.extract_json(await self.generate(prompt, temperature=0.3))
+
+    # ------------------------------------------------------------------
+    # Knowledge documents — prose/reference docs (Oracle, FastAPI how-tos),
+    # not API specs. This is what lets the wiki hold general knowledge the
+    # Karpathy llm-wiki way, so an agent can reason across services AND domains.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _doc_id(source_app: str, filename: str) -> str:
+        stem = filename.rsplit(".", 1)[0]
+        return f"{source_app}:{stem}" if source_app else stem
+
+    async def generate_knowledge(
+        self, markdowns: Dict[str, str], source_app: Optional[str] = None
+    ) -> dict:
+        """Extract a structured knowledge entry per prose document.
+
+        Returns {doc_id: {title, summary, topics: [...], key_points: [...]}}.
+        Mock derives everything deterministically from the markdown (title from
+        the H1, summary from the opening text, topics from headings, key_points
+        from bullet/numbered lines) so retrieval still reflects real content.
+        """
+        if self._mock_mode():
+            out: dict = {}
+            for filename, content in markdowns.items():
+                content = content or ""
+                # Drop YAML frontmatter for the body view.
+                body = content
+                if body.startswith("---"):
+                    end = body.find("---", 3)
+                    if end != -1:
+                        body = body[end + 3:]
+                h1 = _H1_RE.search(content)
+                title = h1.group(1).strip() if h1 else filename
+                headings = re.findall(r"^#{1,6}\s+(.+)$", body, re.MULTILINE)
+                points = re.findall(r"^\s*(?:[-*]|\d+\.)\s+(.+)$", body, re.MULTILINE)
+                # Summary: first non-heading, non-bullet prose, generously sized
+                # so keyword search over the entry finds in-body terms.
+                prose = "\n".join(
+                    ln for ln in body.splitlines()
+                    if ln.strip() and not ln.lstrip().startswith(("#", "-", "*"))
+                    and not re.match(r"^\s*\d+\.\s", ln)
+                )
+                out[self._doc_id(source_app, filename)] = {
+                    "title": title,
+                    "summary": prose.strip()[:600],
+                    "topics": [h.strip() for h in headings][:20],
+                    "key_points": [p.strip() for p in points][:20],
+                }
+            return out
+
+        combined = "\n\n".join(f"## File: {fn}\n{c}" for fn, c in markdowns.items())
+        prompt = (
+            "Extract structured knowledge from these documents (prose/reference, not "
+            "API specs). For each document output a concise factual summary, the main "
+            "topics, and the key takeaways someone would act on.\n\n"
+            "Output ONLY valid JSON keyed by a short doc id:\n"
+            '{"<doc_id>": {"title": "...", "summary": "...", "topics": ["..."], '
+            '"key_points": ["..."]}}\n\n'
+            f"{combined}"
         )
         return self.extract_json(await self.generate(prompt, temperature=0.3))

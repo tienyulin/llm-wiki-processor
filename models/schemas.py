@@ -9,6 +9,7 @@ class ProcessRequest(BaseModel):
     trigger_info: dict
     source_app: Optional[str] = None  # e.g., "app-inventory"
     source_version: Optional[str] = None  # git commit sha or version tag
+    doc_type: Optional[str] = None  # "api" | "knowledge"; None = auto-detect
 
     @field_validator("markdowns")
     @classmethod
