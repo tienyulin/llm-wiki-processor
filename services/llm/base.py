@@ -314,55 +314,46 @@ class LLMProvider(ABC):
         """Cross-app concept synthesis over the WHOLE wiki.
 
         Returns {concept: {"description", "related": ["module::api_key" |
-        "knowledge::doc_id", ...], "apps": [...]}}. Mock clusters endpoints by
-        shared first path segment, then links knowledge docs that *mention* a
-        concept token — so an Oracle "flashback" doc and a flashback-api
-        `/recover` endpoint land on the same concept (cross-domain reasoning).
-        """
-        if self._mock_mode():
-            concepts: dict = {}
-            for module, endpoints in (apis or {}).items():
-                if not isinstance(endpoints, dict):
-                    continue
-                for api_key, detail in endpoints.items():
-                    token = self._concept_token(api_key)
-                    app = detail.get("source_app", module) if isinstance(detail, dict) else module
-                    c = concepts.setdefault(
-                        token, {"description": f"Concept '{token}'.", "related": [], "apps": []}
-                    )
-                    c["related"].append(f"{module}::{api_key}")
-                    if app not in c["apps"]:
-                        c["apps"].append(app)
-            # Link knowledge docs to any concept token they mention.
-            for doc_id, entry in (knowledge or {}).items():
-                if not isinstance(entry, dict):
-                    continue
-                text = " ".join([
-                    entry.get("title", ""), entry.get("summary", ""),
-                    " ".join(entry.get("topics", [])), " ".join(entry.get("key_points", [])),
-                ]).lower()
-                app = entry.get("source_app", "")
-                for token, c in concepts.items():
-                    if token in text:
-                        c["related"].append(f"knowledge::{doc_id}")
-                        if app and app not in c["apps"]:
-                            c["apps"].append(app)
-            return concepts
+        "knowledge::doc_id", ...], "apps": [...]}}. Clusters endpoints by shared
+        first path segment, then links knowledge docs that *mention* a concept
+        token (an Oracle "flashback" doc and a flashback-api `/recover` endpoint
+        land on the same concept). Semantic cross-domain links are added
+        separately by the processor from PG vectors.
 
-        catalogue = "\n".join(
-            f"{module}::{api_key} — {detail.get('description', '') if isinstance(detail, dict) else ''}"
-            for module, endpoints in (apis or {}).items() if isinstance(endpoints, dict)
-            for api_key, detail in endpoints.items()
-        )
-        prompt = (
-            "Identify cross-cutting concepts shared across these API endpoints (e.g. "
-            "authentication, pagination, recovery). For each concept list the endpoints "
-            "that implement it. Output ONLY valid JSON:\n"
-            '{"<concept>": {"description": "...", "related": ["<module>::<api_key>", ...], '
-            '"apps": ["<app>", ...]}}\n\n'
-            f"Endpoints:\n{catalogue}"
-        )
-        return self.extract_json(await self._generate_retry(prompt, temperature=0.3))
+        Deterministic, O(n), no LLM call — on purpose: the old real-LLM version
+        stuffed the WHOLE catalogue into one prompt and timed out at scale
+        (measured: HTTP 500 ReadTimeout on /admin/rebuild-concepts at 280
+        endpoints). This runs in milliseconds at thousands of endpoints. Kept
+        async to preserve the call signature.
+        """
+        concepts: dict = {}
+        for module, endpoints in (apis or {}).items():
+            if not isinstance(endpoints, dict):
+                continue
+            for api_key, detail in endpoints.items():
+                token = self._concept_token(api_key)
+                app = detail.get("source_app", module) if isinstance(detail, dict) else module
+                c = concepts.setdefault(
+                    token, {"description": f"Concept '{token}'.", "related": [], "apps": []}
+                )
+                c["related"].append(f"{module}::{api_key}")
+                if app not in c["apps"]:
+                    c["apps"].append(app)
+        # Link knowledge docs to any concept token they mention.
+        for doc_id, entry in (knowledge or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            text = " ".join([
+                entry.get("title", ""), entry.get("summary", ""),
+                " ".join(entry.get("topics", [])), " ".join(entry.get("key_points", [])),
+            ]).lower()
+            app = entry.get("source_app", "")
+            for token, c in concepts.items():
+                if token in text:
+                    c["related"].append(f"knowledge::{doc_id}")
+                    if app and app not in c["apps"]:
+                        c["apps"].append(app)
+        return concepts
 
     # ------------------------------------------------------------------
     # Knowledge documents — prose/reference docs (Oracle, FastAPI how-tos),
