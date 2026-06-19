@@ -43,6 +43,22 @@ CREATE TABLE IF NOT EXISTS api_entries (
 );
 CREATE INDEX IF NOT EXISTS idx_api_entries_source_app ON api_entries (source_app);
 CREATE INDEX IF NOT EXISTS idx_api_entries_module     ON api_entries (module);
+-- Knowledge documents (prose/reference). Separate table from api_entries so
+-- the API search path is provably unchanged; same embeddings + pgvector machinery.
+CREATE TABLE IF NOT EXISTS knowledge_entries (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    doc_id          TEXT        NOT NULL UNIQUE,
+    source_app      TEXT        NOT NULL,
+    source_version  TEXT,
+    title           TEXT        NOT NULL DEFAULT '',
+    detail          JSONB       NOT NULL,
+    embed_text      TEXT        NOT NULL,
+    embedding       vector({dim}),
+    embedding_model TEXT,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_source_app ON knowledge_entries (source_app);
+
 CREATE TABLE IF NOT EXISTS index_state (
     key        TEXT PRIMARY KEY,
     value      JSONB NOT NULL,
@@ -67,6 +83,12 @@ CREATE INDEX IF NOT EXISTS idx_api_entries_embedding
 -- over this one column covers the same haystack as the old wiki scan.
 CREATE INDEX IF NOT EXISTS idx_api_entries_embed_text_trgm
     ON api_entries USING gin (embed_text gin_trgm_ops);
+-- Knowledge: vector (semantic) + trigram (keyword) so reads can run a hybrid
+-- (RRF) query — evidence shows fusion beats either signal alone.
+CREATE INDEX IF NOT EXISTS idx_knowledge_embedding
+    ON knowledge_entries USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_knowledge_embed_text_trgm
+    ON knowledge_entries USING gin (embed_text gin_trgm_ops);
 """
 
 _DROP_SEARCH_INDEXES_SQL = """
@@ -83,6 +105,23 @@ ON CONFLICT (module, api_key) DO UPDATE SET
     source_app      = EXCLUDED.source_app,
     source_version  = EXCLUDED.source_version,
     description     = EXCLUDED.description,
+    detail          = EXCLUDED.detail,
+    embed_text      = EXCLUDED.embed_text,
+    embedding       = EXCLUDED.embedding,
+    embedding_model = EXCLUDED.embedding_model,
+    updated_at      = now()
+"""
+
+
+_INSERT_KNOWLEDGE_SQL = """
+INSERT INTO knowledge_entries
+    (doc_id, source_app, source_version, title, detail, embed_text, embedding,
+     embedding_model, updated_at)
+VALUES (%s, %s, %s, %s, %s, %s, %s::vector, %s, now())
+ON CONFLICT (doc_id) DO UPDATE SET
+    source_app      = EXCLUDED.source_app,
+    source_version  = EXCLUDED.source_version,
+    title           = EXCLUDED.title,
     detail          = EXCLUDED.detail,
     embed_text      = EXCLUDED.embed_text,
     embedding       = EXCLUDED.embedding,
@@ -260,6 +299,57 @@ class PGVectorStore:
                         "entries": len(rows),
                     },
                 )
+        return True
+
+    async def replace_app_knowledge(
+        self,
+        source_app: str,
+        source_version: str,
+        rows: list[dict],
+        synced_at: datetime,
+    ) -> bool:
+        """Replace one app's knowledge entries (mirrors replace_app_entries).
+
+        rows: [{doc_id, title, detail, embed_text, embedding, embedding_model}].
+        Reuses the app_sync guard so a stale replay can't clobber a newer sync.
+        """
+        await self._ensure_open()
+        async with self._pool.connection() as conn:
+            async with conn.transaction():
+                await conn.execute("SET LOCAL synchronous_commit = off")
+                cur = await conn.execute(
+                    """
+                    INSERT INTO app_sync (source_app, synced_at, source_version)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (source_app) DO UPDATE SET
+                        synced_at = EXCLUDED.synced_at,
+                        source_version = EXCLUDED.source_version
+                    WHERE app_sync.synced_at < EXCLUDED.synced_at
+                    RETURNING source_app
+                    """,
+                    (source_app, synced_at, source_version),
+                )
+                if await cur.fetchone() is None:
+                    logger.warning(f"PG knowledge sync for {source_app} is stale, skipping")
+                    return False
+
+                await conn.execute(
+                    "DELETE FROM knowledge_entries WHERE source_app = %s", (source_app,)
+                )
+                if rows:
+                    async with conn.cursor() as kcur:
+                        await kcur.executemany(
+                            _INSERT_KNOWLEDGE_SQL,
+                            [
+                                (
+                                    r["doc_id"], source_app, source_version,
+                                    r.get("title", ""), Jsonb(r["detail"]),
+                                    r["embed_text"], to_vector_literal(r.get("embedding")),
+                                    r.get("embedding_model"),
+                                )
+                                for r in rows
+                            ],
+                        )
         return True
 
     async def rebuild(self, apps: dict[str, list[dict]], versions: dict[str, str]) -> int:

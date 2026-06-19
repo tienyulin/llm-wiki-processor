@@ -34,3 +34,21 @@ def entry_to_text(module: str, api_key: str, detail) -> str:
 
     parts = [module, api_key, endpoint, description, params_part]
     return " | ".join(p for p in parts if p)
+
+
+def knowledge_to_text(doc_id: str, entry) -> str:
+    """Build the text to embed for one knowledge document.
+
+    Concatenates title | summary | topics | key_points — the distilled fields,
+    which for these short docs act as one focused chunk (good embedding recall
+    without diluting the vector across a long raw document).
+    """
+    if not isinstance(entry, dict):
+        entry = {"summary": str(entry)}
+    parts = [
+        str(entry.get("title") or ""),
+        str(entry.get("summary") or ""),
+        " ".join(entry.get("topics", []) or []),
+        " ".join(entry.get("key_points", []) or []),
+    ]
+    return " | ".join(p for p in parts if p.strip())

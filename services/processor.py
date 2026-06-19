@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 import httpx
 
 from models.schemas import ProcessResponse
-from services.embeddings import EmbeddingClient, entry_to_text
+from services.embeddings import EmbeddingClient, entry_to_text, knowledge_to_text
 from services.llm import LLMProvider
 from repository.minio_client import MinioStorage
 from repository.pg_store import PGVectorStore
@@ -269,6 +269,34 @@ class WikiProcessor:
             logger.warning(f"PG index sync failed for {app} (wiki write succeeded): {e}")
             await self._log_audit(app, len(rows), "success_index_sync_failed", [])
 
+    def _knowledge_rows(self, new_knowledge: dict) -> list[dict]:
+        """Flatten knowledge entries into knowledge_entries rows (no vectors yet)."""
+        rows = []
+        for doc_id, entry in new_knowledge.items():
+            rows.append({
+                "doc_id": doc_id,
+                "title": entry.get("title", "") if isinstance(entry, dict) else "",
+                "detail": entry,
+                "embed_text": knowledge_to_text(doc_id, entry),
+                "embedding": None,
+                "embedding_model": None,
+            })
+        return rows
+
+    async def _sync_knowledge_index(self, app: str, version: str, rows: list[dict], synced_at: datetime):
+        """Best-effort PG sync of knowledge entries (hybrid search index).
+        Same fail-safe contract as _sync_vector_index."""
+        if self.vector_store is None:
+            return
+        try:
+            await self.vector_store.ensure_schema_once()
+            applied = await self.vector_store.replace_app_knowledge(app, version, rows, synced_at)
+            if not applied:
+                logger.info(f"PG knowledge sync for {app} superseded by a newer sync, skipped")
+        except Exception as e:
+            logger.warning(f"PG knowledge sync failed for {app} (wiki write succeeded): {e}")
+            await self._log_audit(app, len(rows), "success_index_sync_failed", [])
+
     async def reindex(self) -> dict:
         """Rebuild the entire PG index from wiki.json (bootstrap on existing
         data, drift repair). Raises when the vector layer is disabled."""
@@ -447,11 +475,17 @@ class WikiProcessor:
             overview: str | None = None
             index_rows: list[dict] = []
 
+            knowledge_rows: list[dict] = []
             if kind == "knowledge":
                 logger.info(f"Knowledge ingest for {app}")
                 generated_k = await self.llm.generate_knowledge(markdowns, source_app=app)
                 new_knowledge = self._stamp_knowledge(generated_k, app, version, markdowns)
                 files_updated = sorted(new_knowledge.keys())
+                # Embed for the hybrid (vector+keyword) knowledge index. Slow part
+                # (embedding) runs here in Phase 1, before the write lock.
+                if self.vector_store is not None:
+                    knowledge_rows = self._knowledge_rows(new_knowledge)
+                    await self._embed_rows(app, knowledge_rows)
             else:
                 if is_first_run:
                     logger.info("First run detected - generating complete wiki")
@@ -505,8 +539,14 @@ class WikiProcessor:
             await self.storage.aput_json(snapshot_key, markdowns)
             await self._log_audit(app, len(markdowns), "success", files_updated)
             # PG sync must precede cache invalidation: when mcp-server drops
-            # its fallback cache, PG already serves the fresh entries.
-            await self._sync_vector_index(app, version, index_rows, sync_ts)
+            # its fallback cache, PG already serves the fresh entries. Only the
+            # path matching this push's kind runs — api and knowledge share the
+            # per-app sync guard, so running both for one timestamp would let the
+            # empty one claim the guard and block the real sync.
+            if kind == "knowledge":
+                await self._sync_knowledge_index(app, version, knowledge_rows, sync_ts)
+            else:
+                await self._sync_vector_index(app, version, index_rows, sync_ts)
             await self._notify_cache_invalidation(source_app)
 
             processing_time_ms = int((time.time() - start_time) * 1000)
