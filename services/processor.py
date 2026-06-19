@@ -268,8 +268,9 @@ class WikiProcessor(VectorSyncMixin):
         # linking literature). Substring links are kept too, so this only *adds*
         # recall; tune via CONCEPT_LINK_MIN_COSINE.
         threshold = float(os.getenv("CONCEPT_LINK_MIN_COSINE", "0.63"))
+        margin = float(os.getenv("CONCEPT_LINK_MARGIN", "0.05"))
         try:
-            links = await self.vector_store.knowledge_api_links(threshold=threshold)
+            links = await self.vector_store.knowledge_api_links(threshold=threshold, margin=margin)
         except Exception as e:
             logger.warning(f"Semantic concept linking skipped: {e}")
             return
