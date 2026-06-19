@@ -340,6 +340,10 @@ class WikiProcessor:
         concepts = await self.llm.generate_concepts(
             wiki.get("apis", {}), knowledge=wiki.get("knowledge", {})
         )
+        # Robustness: augment substring links with semantic ones (embedding
+        # proximity), so a knowledge doc phrased in synonyms still links to the
+        # concept it's about ("roll back" → the /recover concept).
+        await self._link_knowledge_semantically(concepts)
         wiki = {**wiki, "concepts": concepts,
                 "metadata": {**wiki.get("metadata", {}), "updated_at": datetime.now().isoformat()}}
         async with self._write_lock:
@@ -348,6 +352,38 @@ class WikiProcessor:
                 raise RuntimeError("Concept rebuild lost a CAS race; retry")
         await self._notify_cache_invalidation(None)
         return {"concepts": len(concepts)}
+
+    async def _link_knowledge_semantically(self, concepts: dict) -> None:
+        """Add knowledge↔concept links by embedding proximity (in place).
+
+        For each knowledge doc, the nearest API entries (cosine >= threshold)
+        contribute the doc to those endpoints' concepts. No-op when the vector
+        index or embeddings are unavailable (links stay substring-only)."""
+        if self.vector_store is None:
+            return
+        # Floor measured on-corpus: a synonym-only doc that *should* link scored
+        # 0.656 to the recovery endpoint while an unrelated how-to scored 0.599 —
+        # 0.63 sits in that gap (and in the 0.60–0.64 range reported in the entity-
+        # linking literature). Substring links are kept too, so this only *adds*
+        # recall; tune via CONCEPT_LINK_MIN_COSINE.
+        threshold = float(os.getenv("CONCEPT_LINK_MIN_COSINE", "0.63"))
+        try:
+            links = await self.vector_store.knowledge_api_links(threshold=threshold)
+        except Exception as e:
+            logger.warning(f"Semantic concept linking skipped: {e}")
+            return
+        for doc_id, api_links in links.items():
+            ref = f"knowledge::{doc_id}"
+            for module, api_key, _score in api_links:
+                token = self.llm._concept_token(api_key)
+                c = concepts.get(token)
+                if c is None:
+                    continue
+                if ref not in c["related"]:
+                    c["related"].append(ref)
+                app = doc_id.split(":", 1)[0]
+                if app and app not in c["apps"]:
+                    c["apps"].append(app)
 
     async def recompile(self) -> dict:
         """Re-run extraction over stored per-app snapshots without re-ingesting (item 6).

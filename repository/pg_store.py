@@ -352,6 +352,42 @@ class PGVectorStore:
                         )
         return True
 
+    async def knowledge_api_links(
+        self, threshold: float = 0.5, top_n: int = 5
+    ) -> dict[str, list[tuple]]:
+        """Semantic links between knowledge docs and API entries by embedding
+        proximity (for concept linking that survives synonyms — substring
+        linking misses "roll back" ↔ "recover").
+
+        For each embedded knowledge doc, the `top_n` nearest API entries with
+        cosine >= `threshold`. Empty when either side has no vectors.
+        Returns {doc_id: [(module, api_key, score), ...]}.
+        """
+        await self._ensure_open()
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                """
+                SELECT k.doc_id, a.module, a.api_key,
+                       1 - (a.embedding <=> k.embedding) AS score
+                FROM knowledge_entries k
+                CROSS JOIN LATERAL (
+                    SELECT module, api_key, embedding
+                    FROM api_entries
+                    WHERE embedding IS NOT NULL
+                    ORDER BY embedding <=> k.embedding
+                    LIMIT %s
+                ) a
+                WHERE k.embedding IS NOT NULL
+                  AND 1 - (a.embedding <=> k.embedding) >= %s
+                ORDER BY k.doc_id, score DESC
+                """,
+                (top_n, threshold),
+            )
+            out: dict[str, list[tuple]] = {}
+            for doc_id, module, api_key, score in await cur.fetchall():
+                out.setdefault(doc_id, []).append((module, api_key, round(float(score), 4)))
+            return out
+
     async def rebuild(self, apps: dict[str, list[dict]], versions: dict[str, str]) -> int:
         """Full rebuild from wiki.json (bootstrap on existing data, drift repair).
 
