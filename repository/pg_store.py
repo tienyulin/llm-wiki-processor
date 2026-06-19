@@ -130,6 +130,29 @@ ON CONFLICT (doc_id) DO UPDATE SET
 """
 
 
+def _dominant_app_links(candidates: list[tuple], threshold: float, margin: float) -> list[tuple]:
+    """Pick a knowledge doc's API links, or none.
+
+    candidates: [(module, api_key, source_app, score), ...] sorted score desc.
+    A doc links only if its best match's app dominates — best score minus the
+    best score of any *other* app >= margin (a generic doc similar to many apps
+    fails this and links to nothing). Returns that app's matches with
+    score >= threshold as [(module, api_key, round(score,4)), ...].
+    """
+    if not candidates:
+        return []
+    best_app = candidates[0][2]
+    best_score = candidates[0][3]
+    other_best = max((s for _, _, app, s in candidates if app != best_app), default=0.0)
+    if best_score - other_best < margin:
+        return []
+    return [
+        (m, k, round(s, 4))
+        for (m, k, app, s) in candidates
+        if app == best_app and s >= threshold
+    ]
+
+
 def to_vector_literal(vec) -> str | None:
     """Format a vector as a pgvector text literal; None passes through as NULL."""
     if vec is None:
@@ -353,40 +376,47 @@ class PGVectorStore:
         return True
 
     async def knowledge_api_links(
-        self, threshold: float = 0.5, top_n: int = 5
+        self, threshold: float = 0.63, margin: float = 0.05
     ) -> dict[str, list[tuple]]:
         """Semantic links between knowledge docs and API entries by embedding
-        proximity (for concept linking that survives synonyms — substring
-        linking misses "roll back" ↔ "recover").
+        proximity (concept linking that survives synonyms — substring misses
+        "roll back" ↔ "recover").
 
-        For each embedded knowledge doc, the `top_n` nearest API entries with
-        cosine >= `threshold`. Empty when either side has no vectors.
-        Returns {doc_id: [(module, api_key, score), ...]}.
+        A *specific* doc concentrates its top matches in one app; a *generic*
+        doc (e.g. a FastAPI how-to) is flatly similar to endpoints across many
+        apps and must NOT link. So a doc links only when its best app dominates:
+        best score − best score of any *other* app >= `margin`. Then that app's
+        endpoints with cosine >= `threshold` are linked. Both numbers measured
+        on-corpus (see docs/architecture/semantic-concept-linking.md).
+
+        Returns {doc_id: [(module, api_key, score), ...]} (only linked docs).
         """
         await self._ensure_open()
         async with self._pool.connection() as conn:
             cur = await conn.execute(
                 """
-                SELECT k.doc_id, a.module, a.api_key,
+                SELECT k.doc_id, a.module, a.api_key, a.source_app,
                        1 - (a.embedding <=> k.embedding) AS score
                 FROM knowledge_entries k
                 CROSS JOIN LATERAL (
-                    SELECT module, api_key, embedding
+                    SELECT module, api_key, source_app, embedding
                     FROM api_entries
                     WHERE embedding IS NOT NULL
                     ORDER BY embedding <=> k.embedding
-                    LIMIT %s
+                    LIMIT 10
                 ) a
                 WHERE k.embedding IS NOT NULL
-                  AND 1 - (a.embedding <=> k.embedding) >= %s
                 ORDER BY k.doc_id, score DESC
                 """,
-                (top_n, threshold),
             )
-            out: dict[str, list[tuple]] = {}
-            for doc_id, module, api_key, score in await cur.fetchall():
-                out.setdefault(doc_id, []).append((module, api_key, round(float(score), 4)))
-            return out
+            by_doc: dict[str, list[tuple]] = {}
+            for doc_id, module, api_key, source_app, score in await cur.fetchall():
+                by_doc.setdefault(doc_id, []).append((module, api_key, source_app, float(score)))
+            return {
+                doc_id: links
+                for doc_id, cands in by_doc.items()
+                if (links := _dominant_app_links(cands, threshold, margin))
+            }
 
     async def rebuild(self, apps: dict[str, list[dict]], versions: dict[str, str]) -> int:
         """Full rebuild from wiki.json (bootstrap on existing data, drift repair).
