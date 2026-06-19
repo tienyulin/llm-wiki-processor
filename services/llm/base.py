@@ -1,11 +1,15 @@
 """Abstract base class for all LLM providers"""
 
+import asyncio
 import json
 import logging
 import os
+import random
 import re
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional
+
+from .exceptions import APIException, RateLimitException
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +79,40 @@ class LLMProvider(ABC):
     @staticmethod
     def _mock_mode() -> bool:
         return os.getenv("MOCK_LLM", "false").lower() == "true"
+
+    def _llm_semaphore(self) -> "asyncio.Semaphore":
+        """Lazily-built cap on concurrent LLM calls (per process).
+
+        A fleet of apps pushing at once drove the provider into sustained 429s;
+        retry alone only cut failures from 65% to ~43%. Bounding concurrency so
+        the processor never exceeds the provider's rate — queuing the rest — is
+        the real lever. Tunable via LLM_MAX_CONCURRENCY (default 3).
+        """
+        sem = getattr(self, "_sem", None)
+        if sem is None:
+            sem = asyncio.Semaphore(int(os.getenv("LLM_MAX_CONCURRENCY", "3")))
+            self._sem = sem
+        return sem
+
+    async def _generate_retry(self, prompt: str, **kwargs) -> str:
+        """generate() bounded by a concurrency cap, with exponential backoff on
+        rate-limit / transient errors. Tunable via LLM_MAX_RETRIES (default 4),
+        LLM_RETRY_BASE_SECONDS (default 2), LLM_MAX_CONCURRENCY (default 3)."""
+        attempts = int(os.getenv("LLM_MAX_RETRIES", "4"))
+        base = float(os.getenv("LLM_RETRY_BASE_SECONDS", "2"))
+        for attempt in range(attempts + 1):
+            try:
+                async with self._llm_semaphore():
+                    return await self.generate(prompt, **kwargs)
+            except (RateLimitException, APIException) as e:
+                if attempt == attempts:
+                    raise
+                delay = base * (2 ** attempt) + random.uniform(0, base)
+                logger.warning(
+                    f"{type(self).__name__}: {type(e).__name__}, retry "
+                    f"{attempt + 1}/{attempts} in {delay:.1f}s"
+                )
+                await asyncio.sleep(delay)
 
     def extract_json(self, content: str) -> dict:
         """Strip <think> tags and parse JSON from an LLM response."""
@@ -180,7 +218,7 @@ class LLMProvider(ABC):
             f"{context}"
             f"{combined_markdown}"
         )
-        return await self.generate(prompt, temperature=0.2)
+        return await self._generate_retry(prompt, temperature=0.2)
 
     async def _generate_from_analysis(self, combined_markdown: str, analysis: str) -> dict:
         """Step 2: emit final JSON grounded in the step-1 analysis."""
@@ -194,7 +232,7 @@ class LLMProvider(ABC):
             "Every endpoint MUST include a non-empty \"sources\" list naming the markdown "
             "file(s) it was extracted from."
         )
-        content = await self.generate(prompt, temperature=0.3)
+        content = await self._generate_retry(prompt, temperature=0.3)
         return self.extract_json(content)
 
     async def update_wiki(
@@ -270,7 +308,7 @@ class LLMProvider(ABC):
             "API endpoints below. State its purpose and main capabilities. Plain text only.\n\n"
             + "\n".join(lines)
         )
-        return (await self.generate(prompt, temperature=0.3)).strip()
+        return (await self._generate_retry(prompt, temperature=0.3)).strip()
 
     async def generate_concepts(self, apis: dict, knowledge: dict | None = None) -> dict:
         """Cross-app concept synthesis over the WHOLE wiki.
@@ -324,7 +362,7 @@ class LLMProvider(ABC):
             '"apps": ["<app>", ...]}}\n\n'
             f"Endpoints:\n{catalogue}"
         )
-        return self.extract_json(await self.generate(prompt, temperature=0.3))
+        return self.extract_json(await self._generate_retry(prompt, temperature=0.3))
 
     # ------------------------------------------------------------------
     # Knowledge documents — prose/reference docs (Oracle, FastAPI how-tos),
@@ -386,4 +424,4 @@ class LLMProvider(ABC):
             '"key_points": ["..."]}}\n\n'
             f"{combined}"
         )
-        return self.extract_json(await self.generate(prompt, temperature=0.3))
+        return self.extract_json(await self._generate_retry(prompt, temperature=0.3))
