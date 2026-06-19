@@ -30,6 +30,11 @@ Knowledge entries carry the same `sources`/`source_app`/`source_version`
 provenance, and a knowledge doc that *mentions* a concept token (e.g. an Oracle
 "flashback" doc that says "recover") is linked to that concept by
 `/admin/rebuild-concepts` — bridging domains (knowledge ⇄ API).
+
+Knowledge entries are also embedded into a `knowledge_entries` pgvector table
+(vector + trigram indexes), so mcp-server serves **hybrid** (semantic + keyword)
+knowledge search. Best-effort, like the API index; rebuilt from snapshots by
+`/admin/recompile`.
 Response (200):
 ```json
 {

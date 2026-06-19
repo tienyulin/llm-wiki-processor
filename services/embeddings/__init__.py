@@ -9,7 +9,7 @@ vocabulary.
 from .client import EmbeddingClient
 from .config import EmbeddingConfig, load_embedding_env
 from .mock import mock_embed
-from .text import entry_to_text
+from .text import entry_to_text, knowledge_to_text
 
 __all__ = [
     "EmbeddingClient",
@@ -17,4 +17,5 @@ __all__ = [
     "load_embedding_env",
     "mock_embed",
     "entry_to_text",
+    "knowledge_to_text",
 ]
