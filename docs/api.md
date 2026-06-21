@@ -1,41 +1,43 @@
 # wiki-processor API
 
-Base URL: `http://localhost:8001`
+Base URL：`http://localhost:8001`
+
+> 名詞：**CAS（Compare-And-Swap）** = 寫入前比對版本標記（ETag），相符才寫的樂觀鎖；
+> **每-app 物件** = 每個 app 的資料各存一個檔 `apps/<app>.json`；**best-effort** = 盡力，
+> 失敗不中斷主流程。
 
 ## `POST /process`
-Ingest one application's markdown, extract API entries via the LLM, and apply an
-**app-level incremental update** to the shared wiki (MinIO) using an optimistic
-ETag CAS loop. Best-effort syncs the entries into the PG/pgvector index.
+收某個 app 的 markdown，用 LLM 抽出 API 條目，對該 app 做 **app 級增量更新**：寫入它自己的
+物件 `apps/<app>.json`（用 ETag CAS 樂觀鎖，各 app 各自一把鎖、互不競爭）。並盡力把條目
+同步進 PG/pgvector 索引。
 
-Request:
+Request：
 ```json
 {
   "markdowns": {"api.md": "# ... markdown ..."},
   "timestamp": "2026-06-14T00:00:00",
   "trigger_info": {"source": "ci"},
-  "source_app": "my-app",          // app identity; entries stamped + replaced per app
+  "source_app": "my-app",          // app 身分；條目以此 stamp 並按 app 取代
   "source_version": "git-sha",
-  "doc_type": "api"                // "api" | "knowledge"; omit to auto-detect
+  "doc_type": "api"                // "api" | "knowledge"；省略則自動判斷
 }
 ```
 
-**Document types.** `doc_type` selects extraction:
-- `api` — extract endpoints into `wiki.apis` (the default behaviour).
-- `knowledge` — extract a structured entry (title, summary, topics, key_points)
-  from a **prose/reference doc** (e.g. Oracle, a FastAPI how-to) into
-  `wiki.knowledge`, so the wiki holds general knowledge an agent can reason over.
-- Omitted → **auto-detected**: a push containing HTTP endpoints is `api`, else `knowledge`.
+**文件型別。** `doc_type` 決定抽取方式：
+- `api` —— 把 endpoint 抽進 `wiki.apis`（預設行為）。
+- `knowledge` —— 從**散文/參考文件**（如 Oracle、FastAPI how-to）抽出結構化條目
+  （title、summary、topics、key_points）進 `wiki.knowledge`，讓 wiki 也裝 agent 能推理的通用知識。
+- 省略 → **自動判斷**：含 HTTP endpoint 的推送為 `api`，否則 `knowledge`。
 
-Knowledge entries carry the same `sources`/`source_app`/`source_version`
-provenance, and a knowledge doc that *mentions* a concept token (e.g. an Oracle
-"flashback" doc that says "recover") is linked to that concept by
-`/admin/rebuild-concepts` — bridging domains (knowledge ⇄ API).
+知識條目帶同樣的 `sources`/`source_app`/`source_version` 出處；提到某概念 token 的知識文件
+（如 Oracle「flashback」文件寫了「recover」）會被 `/admin/rebuild-concepts` 連到該概念
+—— 橋接領域（knowledge ⇄ API）。
 
-Knowledge entries are also embedded into a `knowledge_entries` pgvector table
-(vector + trigram indexes), so mcp-server serves **hybrid** (semantic + keyword)
-knowledge search. Best-effort, like the API index; rebuilt from snapshots by
-`/admin/recompile`.
-Response (200):
+知識條目也會 embed 進 `knowledge_entries` pgvector 表（向量 + trigram 索引），所以
+mcp-server 提供 **hybrid**（語意 + 關鍵字）知識搜尋。與 API 索引一樣 best-effort；
+`/admin/recompile` 可從 snapshot 重建。
+
+Response（200）：
 ```json
 {
   "status": "success",
@@ -46,56 +48,51 @@ Response (200):
   "processing_time_ms": 1234
 }
 ```
-Auth: send `X-API-Key: $PROCESSOR_API_KEY` when `PROCESSOR_API_KEY` is set
-(empty = open dev mode). Errors are returned as `{"status":"failed", ...}` with
-HTTP 200 (the LLM/embedding failures degrade gracefully).
+驗證：設了 `PROCESSOR_API_KEY` 時要帶 `X-API-Key: $PROCESSOR_API_KEY`（空 = 開放 dev 模式）。
+錯誤以 `{"status":"failed", ...}` + HTTP 200 回傳（LLM/embedding 失敗優雅降級）。
 
-### API entry shape (in `wiki.json` and `GET /get_api_detail`)
+### API 條目格式（在每-app 物件 / 彙總 `wiki.json` / `GET /get_api_detail`）
 ```json
 {
   "method": "POST",
   "path": "/recover",
   "description": "start a flashback recovery job",
-  "sources": ["flashback.md"],   // markdown file(s) this entry was extracted from
-  "source_app": "flashback-api", // stamped by the processor (LLM output is not trusted for provenance)
+  "sources": ["flashback.md"],   // 此條目從哪個 markdown 抽出
+  "source_app": "flashback-api", // 由 processor stamp（出處不信任 LLM 輸出）
   "source_version": "v1.0"
 }
 ```
-`sources` gives per-entry traceability back to the originating markdown; `source_app`
-/`source_version` are stamped by the processor and used for app-level replace/merge.
+`sources` 提供每條目回溯到原始 markdown 的可追溯性；`source_app`/`source_version` 由
+processor stamp，用於 app 級取代/合併。
 
-### Extraction (two-step, real LLM only)
-The LLM path runs a two-step chain of thought: **analyze** the docs (endpoints,
-modules, contradictions, originating file) → **generate** the final JSON grounded in
-that analysis, with a `sources` list per entry. Mock mode (`MOCK_LLM=true`) derives
-the same shape deterministically from the input markdown.
+### 抽取（兩段式，僅真 LLM）
+真 LLM 路徑跑兩段式 chain of thought：**analyze**（分析文件：endpoint、module、矛盾、
+來源檔）→ **generate**（基於分析產生最終 JSON，每條目附 `sources`）。比 single-pass
+讀寫更少幻覺。Mock 模式（`MOCK_LLM=true`）從輸入 markdown 確定性推導出同樣格式。
 
 ## `GET /status`
-`{"status":"running","wiki_size":<app count>,"tracked_files":...,"last_updated":...}`
+`{"status":"running","wiki_size":<app 數>,"tracked_files":...,"last_updated":...}`
 
 ## `POST /admin/reindex`
-Rebuild the PG index from MinIO (`{"status":"ok","apps":N,"entries":M,"embedded":M}`).
-Returns 503 when PG is disabled (`PG_DSN` empty).
+從每-app 物件重建 PG 索引（`{"status":"ok","apps":N,"entries":M,"embedded":M}`）。
+PG 關閉時（`PG_DSN` 空）回 503。
 
 ## `POST /admin/recompile`
-Re-run extraction over stored per-app snapshots without re-ingesting — use after
-an extraction/prompt change. `{"status":"ok","recompiled_apps":[...],"count":N}`.
+對已存的每-app snapshot 重跑抽取，不需重新匯入 —— 抽取/prompt 改動後用。
+`{"status":"ok","recompiled_apps":[...],"count":N}`。
 
 ## `POST /admin/rebuild-concepts`
-Cross-app concept synthesis over the whole wiki; writes `wiki.concepts`. Run after
-a batch of pushes (not per-ingest — it scans the whole wiki).
-`{"status":"ok","concepts":N}`.
+跨應用概念合成，並重建**衍生彙總 `wiki.json`**（合併所有 app + concepts + overviews）。
+批次推送後或排程跑（非每次匯入 —— 它讀全部 app）。`{"status":"ok","concepts":N,...}`。
 
-`wiki.json` also carries `overviews` (`{app: {text, updated_at}}`, refreshed per
-app ingest), `concepts` (`{name: {description, related, apps}}`, built by
-`/admin/rebuild-concepts`), and `knowledge` (`{doc_id: {title, summary, topics,
-key_points, sources, source_app, source_version}}`, from `knowledge` docs). All
-are served by mcp-server.
+> P3 後：每-app 物件 `apps/<app>.json` 是真相來源；彙總 `wiki.json`（給 mcp 讀 concepts/
+> overviews + fallback）由本端點按需重建。`wiki.json` 含 `overviews`、`concepts`、
+> `knowledge`，全部由 mcp-server 提供。
 
 ## `GET /health`
 `{"status":"ok","minio_connected":true,"llm_provider":...,"minimax_accessible":...,
   "vector_index_connected":...,"embeddings_configured":...}`
 
-See also: [llm-provider-abstraction](llm-provider-abstraction.md),
-[concurrency](concurrency.md), and the platform's
-`docs/architecture/vector-search.md`.
+另見：[llm-provider-abstraction](llm-provider-abstraction.md)、
+[concurrency](concurrency.md)、平台的 `docs/architecture/vector-search.md`。
+</content>
