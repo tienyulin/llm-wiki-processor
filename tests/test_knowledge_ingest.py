@@ -63,6 +63,7 @@ async def test_process_auto_detects_knowledge(llm):
     r = await proc.process(_ORACLE_MD, "t", source_app="oracle-kb", source_version="v1")
     assert r.status == "success"
 
+    await proc.rebuild_concepts()  # P3: materialize the aggregate from per-app objects
     wiki = await storage.aget_json("wiki.json")
     assert wiki["apis"] == {}, "prose doc must not create API entries"
     assert wiki["knowledge"], "knowledge section populated"
@@ -78,6 +79,7 @@ async def test_api_and_knowledge_coexist(llm):
                        "t", source_app="flashback-api", source_version="v1")  # api (auto)
     await proc.process(_ORACLE_MD, "t", source_app="oracle-kb", source_version="v1")  # knowledge (auto)
 
+    await proc.rebuild_concepts()
     wiki = await storage.aget_json("wiki.json")
     assert "flashback-api" in wiki["apis"]              # api push preserved
     assert any("oracle" in d for d in wiki["knowledge"])  # knowledge push preserved

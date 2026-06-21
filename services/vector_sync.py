@@ -100,8 +100,9 @@ class VectorSyncMixin:
         if self.vector_store is None:
             raise RuntimeError("Vector index disabled: PG_DSN is not configured")
 
-        wiki = await self.storage.aget_json(_WIKI_KEY) or {}
-        wiki = self._normalize_wiki(wiki)
+        # P3: rebuild from the per-app objects (the source of truth), not the
+        # derived aggregate wiki.json.
+        wiki = await self.aggregate_apps()
 
         apps: dict[str, list[dict]] = {}
         versions: dict[str, str] = {}
