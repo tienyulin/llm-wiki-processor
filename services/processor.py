@@ -248,7 +248,11 @@ class WikiProcessor(VectorSyncMixin):
             e["source_version"] = version
             e["sources"] = sources
             e["updated_at"] = datetime.now().isoformat()
-            stamped[doc_id] = e
+            # Namespace the key by app so real-LLM output ("o.md") matches the
+            # mock's "<app>:<stem>" — consistent, app-scoped, collision-free.
+            stem = str(doc_id).rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            key = doc_id if str(doc_id).startswith(f"{app}:") else f"{app}:{stem}"
+            stamped[key] = e
         return stamped
 
     # Vector-index sync (_entry_rows / _embed_rows / _sync_vector_index /
