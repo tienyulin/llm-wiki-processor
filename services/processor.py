@@ -18,10 +18,15 @@ from repository.pg_store import PGVectorStore
 
 logger = logging.getLogger(__name__)
 
-_WIKI_KEY = "wiki.json"
+_WIKI_KEY = "wiki.json"          # derived aggregate (concepts/overviews + merged view), rebuilt
+_APP_PREFIX = "apps/"            # per-app source of truth: apps/<app>.json (P3 — O(1) writes)
 _SNAPSHOT_KEY = "markdowns_snapshot.json"
 _APP_SNAPSHOT_PREFIX = "snapshots/"
 _AUDIT_PREFIX = "audit/"
+
+
+def _app_key(app: str) -> str:
+    return f"{_APP_PREFIX}{app}.json"
 _SCHEMA_VERSION = 2
 _CAS_MAX_RETRIES = 5
 
@@ -205,6 +210,31 @@ class WikiProcessor(VectorSyncMixin):
             "metadata": {**wiki.get("metadata", {}), "updated_at": datetime.now().isoformat()},
         }
 
+    def _build_app_object(
+        self, app_obj: dict, app: str, kind: str, new_apis: dict,
+        new_knowledge: dict, overview: str | None, version: str,
+    ) -> dict:
+        """This app's object: replace the section this push owns (apis OR
+        knowledge), keep the other section + overview. The app pushes its full
+        markdown set each time, so new_apis/new_knowledge is the complete set."""
+        if kind == "knowledge":
+            apis = app_obj.get("apis", {})
+            knowledge = new_knowledge
+            ov = app_obj.get("overview")
+        else:
+            apis = new_apis
+            knowledge = app_obj.get("knowledge", {})
+            ov = overview
+        return {
+            "schema_version": _SCHEMA_VERSION,
+            "source_app": app,
+            "source_version": version,
+            "apis": apis,
+            "knowledge": knowledge,
+            "overview": ov,
+            "updated_at": datetime.now().isoformat(),
+        }
+
     def _stamp_knowledge(self, knowledge: dict, app: str, version: str, markdowns: dict) -> dict:
         """Stamp provenance onto each knowledge entry (processor owns provenance).
         `sources` lists the markdown files this push carried."""
@@ -225,34 +255,52 @@ class WikiProcessor(VectorSyncMixin):
     # _knowledge_rows / _sync_knowledge_index / reindex) lives in
     # VectorSyncMixin — the optional, best-effort PG layer kept out of the core.
 
-    async def rebuild_concepts(self) -> dict:
-        """Cross-app concept synthesis over the whole wiki (item 2).
+    async def aggregate_apps(self) -> dict:
+        """Merge all per-app objects (apps/<app>.json) into one wiki dict.
 
-        Runs whole-wiki, like reindex — NOT on every ingest, which would mean a
-        full-wiki LLM scan + shared-blob write per app push (cost + CAS
-        contention). Call after a batch of pushes, or on a schedule.
-        # ponytail: whole-wiki rebuild; switch to incremental concept merge if
-        # the wiki grows past what one LLM call can hold.
-        """
-        raw, etag = await self.storage.aget_json_with_etag(_WIKI_KEY)
-        if raw is None:
-            return {"concepts": 0}
-        wiki = self._normalize_wiki(raw)
+        The whole-wiki view consumers (concepts, mcp fallback) need; built by
+        reading each small app object, not by keeping one giant blob hot."""
+        merged_apis: dict = {}
+        merged_knowledge: dict = {}
+        overviews: dict = {}
+        for key in await self.storage.alist_files(_APP_PREFIX):
+            if not key.endswith(".json"):
+                continue
+            obj = await self.storage.aget_json(key) or {}
+            for module, endpoints in (obj.get("apis") or {}).items():
+                merged_apis.setdefault(module, {}).update(endpoints)
+            merged_knowledge.update(obj.get("knowledge") or {})
+            app = obj.get("source_app")
+            if app and obj.get("overview") is not None:
+                overviews[app] = {"text": obj["overview"], "updated_at": obj.get("updated_at", "")}
+        return {
+            "schema_version": _SCHEMA_VERSION,
+            "apis": merged_apis,
+            "knowledge": merged_knowledge,
+            "overviews": overviews,
+        }
+
+    async def rebuild_concepts(self) -> dict:
+        """Rebuild the derived aggregate wiki.json from the per-app objects:
+        merge all apps, synthesize concepts, write wiki.json (the view mcp reads
+        for concepts/overviews + fallback). Run after a batch of pushes or on a
+        schedule — the per-push hot path no longer touches this aggregate."""
+        agg = await self.aggregate_apps()
         concepts = await self.llm.generate_concepts(
-            wiki.get("apis", {}), knowledge=wiki.get("knowledge", {})
+            agg["apis"], knowledge=agg["knowledge"]
         )
-        # Robustness: augment substring links with semantic ones (embedding
-        # proximity), so a knowledge doc phrased in synonyms still links to the
-        # concept it's about ("roll back" → the /recover concept).
+        # Augment substring links with semantic ones (embedding proximity) so a
+        # synonym-phrased knowledge doc still links to its concept.
         await self._link_knowledge_semantically(concepts)
-        wiki = {**wiki, "concepts": concepts,
-                "metadata": {**wiki.get("metadata", {}), "updated_at": datetime.now().isoformat()}}
-        async with self._write_lock:
-            ok = await self.storage.aput_json_if_match(_WIKI_KEY, wiki, etag)
-            if not ok:
-                raise RuntimeError("Concept rebuild lost a CAS race; retry")
+        wiki = {
+            **agg,
+            "concepts": concepts,
+            "metadata": {"version": "1.0", "updated_at": datetime.now().isoformat()},
+        }
+        await self.storage.aput_json(_WIKI_KEY, wiki)
         await self._notify_cache_invalidation(None)
-        return {"concepts": len(concepts)}
+        return {"concepts": len(concepts), "apps": len(agg["overviews"]),
+                "endpoints": sum(len(e) for e in agg["apis"].values())}
 
     async def _link_knowledge_semantically(self, concepts: dict) -> None:
         """Add knowledge↔concept links by embedding proximity (in place).
@@ -385,9 +433,12 @@ class WikiProcessor(VectorSyncMixin):
 
         try:
             # ---- Phase 1: read + LLM (no lock, fully concurrent) ----
-            raw, etag = await self.storage.aget_json_with_etag(_WIKI_KEY)
-            is_first_run = raw is None
-            wiki = _default_wiki() if is_first_run else self._normalize_wiki(raw)
+            # P3: source of truth is this app's own object — a push reads/writes
+            # only apps/<app>.json (small, O(1)), never the whole-wiki blob. No
+            # cross-app contention; the aggregate wiki.json is rebuilt separately.
+            app_obj, etag = await self.storage.aget_json_with_etag(_app_key(app))
+            is_first_run = app_obj is None
+            app_obj = app_obj or {"apis": {}, "knowledge": {}}
 
             old_snapshot = await self.storage.aget_json(snapshot_key) or {}
             changes = self.detect_changes(old_snapshot, markdowns)
@@ -430,7 +481,7 @@ class WikiProcessor(VectorSyncMixin):
                     generated = await self.llm.generate_wiki(markdowns, source_app=source_app)
                 else:
                     logger.info(f"App-level update for {app}")
-                    current_entries = self._app_entries(wiki, app)
+                    current_entries = app_obj.get("apis", {})
                     generated = await self.llm.update_wiki(
                         current_apis=current_entries,
                         changed_markdowns=markdowns,
@@ -453,26 +504,29 @@ class WikiProcessor(VectorSyncMixin):
                     index_rows = self._entry_rows(new_apis)
                     await self._embed_rows(app, index_rows)
 
-            # ---- Phase 2: merge + conditional write (bounded CAS loop) ----
-            async with self._write_lock:
-                for attempt in range(_CAS_MAX_RETRIES):
-                    merged = self._merge_app_entries(
-                        wiki, app, new_apis, overview=overview, new_knowledge=new_knowledge
-                    )
-                    if etag is None:
-                        ok = await self.storage.aput_json_if_absent(_WIKI_KEY, merged)
-                    else:
-                        ok = await self.storage.aput_json_if_match(_WIKI_KEY, merged, etag)
-                    if ok:
-                        break
-                    logger.info(f"CAS conflict for {app} (attempt {attempt + 1}), retrying")
-                    await asyncio.sleep(random.uniform(0.01, 0.05) * (attempt + 1))
-                    raw, etag = await self.storage.aget_json_with_etag(_WIKI_KEY)
-                    wiki = self._normalize_wiki(raw) if raw is not None else _default_wiki()
+            # ---- Phase 2: write this app's object (CAS on its own key) ----
+            # Each app has a distinct key, so concurrent pushes from different
+            # apps never contend (no global lock). The CAS loop only guards
+            # concurrent pushes of the SAME app (rare). The write is O(this app),
+            # not O(all apps) — that's the P3 win.
+            for attempt in range(_CAS_MAX_RETRIES):
+                merged = self._build_app_object(
+                    app_obj, app, kind, new_apis, new_knowledge, overview, version
+                )
+                if etag is None:
+                    ok = await self.storage.aput_json_if_absent(_app_key(app), merged)
                 else:
-                    raise RuntimeError(
-                        f"Wiki write failed after {_CAS_MAX_RETRIES} CAS attempts for {app}"
-                    )
+                    ok = await self.storage.aput_json_if_match(_app_key(app), merged, etag)
+                if ok:
+                    break
+                logger.info(f"CAS conflict for {app} (attempt {attempt + 1}), retrying")
+                await asyncio.sleep(random.uniform(0.01, 0.05) * (attempt + 1))
+                app_obj, etag = await self.storage.aget_json_with_etag(_app_key(app))
+                app_obj = app_obj or {"apis": {}, "knowledge": {}}
+            else:
+                raise RuntimeError(
+                    f"App write failed after {_CAS_MAX_RETRIES} CAS attempts for {app}"
+                )
 
             await self.storage.aput_json(snapshot_key, markdowns)
             await self._log_audit(app, len(markdowns), "success", files_updated)

@@ -160,6 +160,9 @@ async def test_end_to_end_two_apps_real_case():
 
     assert r1.status == "success" and r2.status == "success"
 
+    # P3: per-app objects are the source of truth; the aggregate wiki.json is
+    # built on demand. rebuild_concepts() materializes it.
+    await proc.rebuild_concepts()
     wiki = await storage.aget_json("wiki.json")
     apis = wiki["apis"]
 
@@ -233,6 +236,7 @@ async def test_recompile_refreshes_from_snapshots():
     result = await proc.recompile()
 
     assert "flashback-api" in result["recompiled_apps"]
+    await proc.rebuild_concepts()
     wiki = await storage.aget_json("wiki.json")
     # Entries are back after recompile, stamped with the recompiled version.
     assert wiki["apis"]["flashback-api"]["POST /recover"]["source_version"] == "recompiled"
