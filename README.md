@@ -1,5 +1,7 @@
 # wiki-processor
 
+> 👉 想看這個服務**實際怎麼運作（含真實紀錄）**：[docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md)。
+
 LLM Wiki 平台的**寫入端（ingestion + indexing）**服務。收某個 app 的 markdown，
 用 LLM 抽出結構化的 API 條目，對 MinIO 裡的 wiki 做**應用級增量更新（app-level
 incremental update）**，並盡力（best-effort）把條目同步進 Postgres/pgvector 索引供
