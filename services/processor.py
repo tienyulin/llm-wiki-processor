@@ -45,6 +45,80 @@ def _looks_like_api(markdowns: dict) -> bool:
     return False
 
 
+_KNOWLEDGE_TYPES = {"tutorial", "how-to", "reference", "explanation"}
+_FM_LIST_RE = re.compile(r"^\[(.*)\]$")
+
+
+def _parse_frontmatter(markdowns: dict) -> dict:
+    """Extract `type` / `tags` from the first markdown's YAML frontmatter.
+
+    Tiny parser for the controlled subset (scalar + inline list) — matches the
+    authoring standard (docs/guides/authoring-source-docs.md); not a full YAML
+    engine. Returns {} when there's no frontmatter."""
+    for content in markdowns.values():
+        if not content or not content.startswith("---"):
+            continue
+        end = content.find("\n---", 3)
+        if end == -1:
+            continue
+        out: dict = {}
+        for line in content[3:end].splitlines():
+            if ":" not in line or line.lstrip().startswith("#"):
+                continue
+            key, _, val = line.partition(":")
+            key, val = key.strip(), val.strip().strip("'\"")
+            m = _FM_LIST_RE.match(val)
+            if m:
+                out[key] = [v.strip().strip("'\"") for v in m.group(1).split(",") if v.strip()]
+            elif val:
+                out[key] = val
+        return out
+    return {}
+
+
+def _apis_from_openapi(spec: dict, source_app: str) -> dict:
+    """Deterministically build wiki API entries from an OpenAPI spec — no LLM.
+
+    Returns {module: {"METHOD /path": {method, path, description, parameters,
+    sources}}}. module = source_app (matches the LLM/mock module key)."""
+    module = source_app or _SYSTEM_APP
+    out: dict = {module: {}}
+    for path, item in (spec.get("paths") or {}).items():
+        if not isinstance(item, dict):
+            continue
+        for method, op in item.items():
+            if method.lower() not in ("get", "post", "put", "delete", "patch"):
+                continue
+            if not isinstance(op, dict):
+                continue
+            desc = (op.get("summary") or op.get("description") or "").strip()
+            params = [p.get("name") for p in op.get("parameters", []) if isinstance(p, dict) and p.get("name")]
+            out[module][f"{method.upper()} {path}"] = {
+                "method": method.upper(),
+                "path": path,
+                "description": desc,
+                "parameters": params,
+                "sources": ["openapi.json"],
+            }
+    return out
+
+
+def _readme_summary(markdowns: dict) -> str:
+    """First prose paragraph across the markdowns (deterministic overview for the
+    OpenAPI path, so it needs no LLM call)."""
+    for content in markdowns.values():
+        body = content or ""
+        if body.startswith("---"):
+            e = body.find("\n---", 3)
+            if e != -1:
+                body = body[e + 4:]
+        for line in body.splitlines():
+            s = line.strip()
+            if s and not s.startswith(("#", "-", "*", "|")) and not _ENDPOINT_RE.match(s):
+                return s[:500]
+    return ""
+
+
 def _default_wiki() -> dict:
     """Fresh canonical (v2) wiki with a creation timestamp evaluated at call time."""
     return {
@@ -235,9 +309,11 @@ class WikiProcessor(VectorSyncMixin):
             "updated_at": datetime.now().isoformat(),
         }
 
-    def _stamp_knowledge(self, knowledge: dict, app: str, version: str, markdowns: dict) -> dict:
+    def _stamp_knowledge(self, knowledge: dict, app: str, version: str, markdowns: dict,
+                         doc_type: str = None, tags: list = None) -> dict:
         """Stamp provenance onto each knowledge entry (processor owns provenance).
-        `sources` lists the markdown files this push carried."""
+        `sources` lists the markdown files this push carried. doc_type/tags come
+        from the source-doc frontmatter (authoring standard)."""
         sources = sorted(markdowns.keys())
         stamped: dict = {}
         for doc_id, entry in (knowledge or {}).items():
@@ -247,6 +323,10 @@ class WikiProcessor(VectorSyncMixin):
             e["source_app"] = app
             e["source_version"] = version
             e["sources"] = sources
+            if doc_type:
+                e["doc_type"] = doc_type
+            if tags:
+                e["tags"] = tags
             e["updated_at"] = datetime.now().isoformat()
             # Namespace the key by app so real-LLM output ("o.md") matches the
             # mock's "<app>:<stem>" — consistent, app-scoped, collision-free.
@@ -415,6 +495,7 @@ class WikiProcessor(VectorSyncMixin):
         source_app: str = None,
         source_version: str = None,
         doc_type: str = None,
+        openapi: dict = None,
     ) -> ProcessResponse:
         """
         Two-phase pipeline:
@@ -461,7 +542,20 @@ class WikiProcessor(VectorSyncMixin):
                     processing_time_ms=processing_time_ms,
                 )
 
-            kind = doc_type or ("api" if _looks_like_api(markdowns) else "knowledge")
+            # Source-doc metadata (authoring standard): frontmatter type/tags.
+            fm = _parse_frontmatter(markdowns)
+            fm_type, fm_tags = fm.get("type"), (fm.get("tags") or [])
+            # kind precedence: explicit doc_type > openapi present > frontmatter type > auto-detect
+            if doc_type:
+                kind = doc_type
+            elif openapi:
+                kind = "api"
+            elif fm_type == "api":
+                kind = "api"
+            elif fm_type in _KNOWLEDGE_TYPES:
+                kind = "knowledge"
+            else:
+                kind = "api" if _looks_like_api(markdowns) else "knowledge"
 
             new_apis: dict = {}
             new_knowledge: dict = {}
@@ -472,13 +566,31 @@ class WikiProcessor(VectorSyncMixin):
             if kind == "knowledge":
                 logger.info(f"Knowledge ingest for {app}")
                 generated_k = await self.llm.generate_knowledge(markdowns, source_app=app)
-                new_knowledge = self._stamp_knowledge(generated_k, app, version, markdowns)
+                new_knowledge = self._stamp_knowledge(
+                    generated_k, app, version, markdowns, doc_type=fm_type, tags=fm_tags
+                )
                 files_updated = sorted(new_knowledge.keys())
                 # Embed for the hybrid (vector+keyword) knowledge index. Slow part
                 # (embedding) runs here in Phase 1, before the write lock.
                 if self.vector_store is not None:
                     knowledge_rows = self._knowledge_rows(new_knowledge)
                     await self._embed_rows(app, knowledge_rows)
+            elif openapi:
+                # Deterministic ingest from OpenAPI — no LLM (accurate, no 429).
+                logger.info(f"OpenAPI ingest for {app} ({len(openapi.get('paths', {}))} paths)")
+                new_apis = self._stamp(_apis_from_openapi(openapi, app), app, version)
+                for endpoints in new_apis.values():
+                    for detail in endpoints.values():
+                        if fm_tags:
+                            detail["tags"] = fm_tags
+                files_updated = sorted(
+                    api_key for endpoints in new_apis.values() for api_key in endpoints
+                )
+                # Deterministic overview from the README's first paragraph (still no LLM).
+                overview = _readme_summary(markdowns) or None
+                if self.vector_store is not None:
+                    index_rows = self._entry_rows(new_apis)
+                    await self._embed_rows(app, index_rows)
             else:
                 if is_first_run:
                     logger.info("First run detected - generating complete wiki")
@@ -494,6 +606,10 @@ class WikiProcessor(VectorSyncMixin):
                     )
 
                 new_apis = self._stamp(generated.get("apis", {}), app, version)
+                for endpoints in new_apis.values():
+                    for detail in endpoints.values():
+                        if fm_tags:
+                            detail["tags"] = fm_tags
                 files_updated = sorted(
                     api_key for endpoints in new_apis.values() for api_key in endpoints
                 )

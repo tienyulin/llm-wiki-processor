@@ -10,6 +10,7 @@ class ProcessRequest(BaseModel):
     source_app: Optional[str] = None  # e.g., "app-inventory"
     source_version: Optional[str] = None  # git commit sha or version tag
     doc_type: Optional[str] = None  # "api" | "knowledge"; None = auto-detect
+    openapi: Optional[dict] = None  # OpenAPI spec → deterministic endpoint ingest (skips LLM)
 
     @field_validator("markdowns")
     @classmethod

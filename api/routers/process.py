@@ -30,6 +30,7 @@ async def process(
             source_app=request.source_app,
             source_version=request.source_version,
             doc_type=request.doc_type,
+            openapi=request.openapi,
         )
     except HTTPException:
         raise
