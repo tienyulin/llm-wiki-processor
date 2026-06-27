@@ -75,16 +75,16 @@ def test_entry_to_text_full_entry():
         },
     )
     assert text == (
-        'inventory | GET /inventory/{id} | GET /inventory/{id} | Get one item | {"id": "string"}'
+        'Get one item | inventory | GET /inventory/{id} | {"id": "string"}'
     )
 
 
 def test_entry_to_text_drops_empty_parts():
-    assert entry_to_text("mod", "DOC readme.md", {"description": "Intro"}) == "mod | DOC readme.md | Intro"
+    assert entry_to_text("mod", "DOC readme.md", {"description": "Intro"}) == "Intro | mod | DOC readme.md"
 
 
 def test_entry_to_text_non_dict_detail():
-    assert entry_to_text("mod", "KEY", "plain string") == "mod | KEY | plain string"
+    assert entry_to_text("mod", "KEY", "plain string") == "plain string | mod | KEY"
 
 
 def test_entry_to_text_truncates_parameters():
