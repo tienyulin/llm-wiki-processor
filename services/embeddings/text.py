@@ -14,16 +14,17 @@ _PARAMS_MAX_CHARS = 500
 def entry_to_text(module: str, api_key: str, detail) -> str:
     """Build the text to embed for one API entry.
 
-    Format: "{module} | {api_key} | {METHOD /path} | {description} | {params-json}"
-    with empty parts dropped. Parameters JSON is truncated — field names are
-    what matters for recall, not full nested schemas.
+    Format: "{description} | {module} | {api_key} | {params-json}" with empty
+    parts dropped. The description leads because it is the semantic, translatable
+    part and must dominate the embedding — leading with the module name and the
+    English METHOD/path otherwise pulls cross-language queries off-target (a
+    Chinese query ranking every Chinese-described entry above an equally-relevant
+    English one). The old format also repeated the endpoint, which is already
+    carried verbatim by api_key ("{METHOD} {path}"); that duplication is dropped.
+    Parameters JSON is truncated — field names matter for recall, not schemas.
     """
     if not isinstance(detail, dict):
         detail = {"description": str(detail)}
-
-    method = str(detail.get("method") or "").strip()
-    path = str(detail.get("path") or "").strip()
-    endpoint = " ".join(p for p in (method, path) if p)
 
     params = detail.get("parameters")
     params_part = ""
@@ -32,7 +33,7 @@ def entry_to_text(module: str, api_key: str, detail) -> str:
 
     description = str(detail.get("description") or "").strip()
 
-    parts = [module, api_key, endpoint, description, params_part]
+    parts = [description, module, api_key, params_part]
     return " | ".join(p for p in parts if p)
 
 
