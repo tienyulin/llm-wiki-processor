@@ -16,6 +16,15 @@ logger = logging.getLogger(__name__)
 _ENDPOINT_RE = re.compile(r"\b(GET|POST|PUT|DELETE|PATCH)\s+(/[\w/{}.-]*)")
 _H1_RE = re.compile(r"^#\s+(.+)$", re.MULTILINE)
 
+# Preserve the source language in human-readable output. The wiki is searched
+# in the same language it was authored in (e.g. a Chinese query against a Chinese
+# README); translating descriptions/summaries to English breaks that recall.
+_LANGUAGE_RULE = (
+    "\n\nIMPORTANT: write every human-readable field (description, summary, "
+    "overview, title, topics, key_points) in the SAME language as the source "
+    "document. If the source is Chinese, respond in Chinese. Do not translate."
+)
+
 
 class LLMProvider(ABC):
     """
@@ -231,6 +240,7 @@ class LLMProvider(ABC):
             '"description": "...", "sources": ["<source filename>"]}}}, "metadata": {}}\n'
             "Every endpoint MUST include a non-empty \"sources\" list naming the markdown "
             "file(s) it was extracted from."
+            + _LANGUAGE_RULE
         )
         content = await self._generate_retry(prompt, temperature=0.3)
         return self.extract_json(content)
@@ -305,7 +315,8 @@ class LLMProvider(ABC):
             return f"{app}: {len(lines)} endpoint(s). " + "; ".join(lines)
         prompt = (
             f"Write a concise one-paragraph overview of the '{app}' service based on its "
-            "API endpoints below. State its purpose and main capabilities. Plain text only.\n\n"
+            "API endpoints below. State its purpose and main capabilities. Plain text only."
+            + _LANGUAGE_RULE + "\n\n"
             + "\n".join(lines)
         )
         return (await self._generate_retry(prompt, temperature=0.3)).strip()
@@ -412,7 +423,8 @@ class LLMProvider(ABC):
             "topics, and the key takeaways someone would act on.\n\n"
             "Output ONLY valid JSON keyed by a short doc id:\n"
             '{"<doc_id>": {"title": "...", "summary": "...", "topics": ["..."], '
-            '"key_points": ["..."]}}\n\n'
+            '"key_points": ["..."]}}'
+            + _LANGUAGE_RULE + "\n\n"
             f"{combined}"
         )
         return self.extract_json(await self._generate_retry(prompt, temperature=0.3))

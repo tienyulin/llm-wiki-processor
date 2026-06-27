@@ -232,8 +232,13 @@ class PGVectorStore:
                     f"EMBEDDING_DIM={dim}; old and new vectors are incomparable. "
                     f"Drop the api_entries table and POST /admin/reindex."
                 )
-            if existing_dim is None:
-                await conn.execute(_TABLES_SQL.format(dim=int(dim)))
+            # Always run the (fully idempotent, CREATE TABLE IF NOT EXISTS) DDL.
+            # Gating it on api_entries' existence would skip creating sibling
+            # tables (e.g. knowledge_entries) whenever the schema is partial —
+            # e.g. a DB that an older build populated with only api_entries —
+            # leaving "relation knowledge_entries does not exist" forever. The
+            # dim-mismatch guard above still protects api_entries' vector width.
+            await conn.execute(_TABLES_SQL.format(dim=int(dim)))
             await conn.execute(_SEARCH_INDEXES_SQL)
             await conn.commit()
 
