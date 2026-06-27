@@ -79,3 +79,23 @@ async def test_process_knowledge_stores_type_tags(llm):
     wiki = await storage.aget_json("wiki.json")
     k = next(iter(wiki["knowledge"].values()))
     assert k["doc_type"] == "how-to" and k["tags"] == ["recovery"]
+
+
+async def test_openapi_only_change_reingests(llm):
+    """An openapi-only change (README unchanged) must re-ingest, not no-op —
+    this is the 'fill endpoint descriptions in code' workflow."""
+    storage = _FakeStorage()
+    proc = WikiProcessor(storage=storage, llm=llm)
+    md = {"README.md": "---\ntype: api\nsource_app: pay\n---\n# Pay\nHandles charges."}
+    spec1 = {"openapi": "3.1.0", "paths": {"/charge": {"post": {"summary": "Charge a card"}}}}
+    r1 = await proc.process(md, "t1", source_app="pay", source_version="v1", openapi=spec1)
+    assert "POST /charge" in r1.files_updated
+
+    # Same README, richer description in the spec (regenerated from code).
+    spec2 = {"openapi": "3.1.0", "paths": {"/charge": {"post": {"summary": "對信用卡扣款收取款項"}}}}
+    r2 = await proc.process(md, "t2", source_app="pay", source_version="v2", openapi=spec2)
+    assert "POST /charge" in r2.files_updated, "openapi-only change was dropped as no-op"
+
+    # Identical README + identical spec → genuine no-op.
+    r3 = await proc.process(md, "t3", source_app="pay", source_version="v3", openapi=spec2)
+    assert r3.files_updated == []
