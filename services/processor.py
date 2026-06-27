@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import random
@@ -526,7 +527,16 @@ class WikiProcessor(VectorSyncMixin):
             app_obj = app_obj or {"apis": {}, "knowledge": {}}
 
             old_snapshot = await self.storage.aget_json(snapshot_key) or {}
-            changes = self.detect_changes(old_snapshot, markdowns)
+            # Fold the OpenAPI spec into the change-detection snapshot so an
+            # openapi-only change still re-ingests. Without this, filling endpoint
+            # descriptions in code (which regenerates openapi.json but leaves the
+            # README untouched) would be dropped as "no changes".
+            snapshot = dict(markdowns)
+            if openapi is not None:
+                snapshot["__openapi__.json"] = json.dumps(
+                    openapi, sort_keys=True, ensure_ascii=False
+                )
+            changes = self.detect_changes(old_snapshot, snapshot)
 
             if not any(changes.values()):
                 logger.info(f"No content changes for {app}, skipping LLM call")
@@ -648,7 +658,7 @@ class WikiProcessor(VectorSyncMixin):
                     f"App write failed after {_CAS_MAX_RETRIES} CAS attempts for {app}"
                 )
 
-            await self.storage.aput_json(snapshot_key, markdowns)
+            await self.storage.aput_json(snapshot_key, snapshot)
             await self._log_audit(app, len(markdowns), "success", files_updated)
             # PG sync must precede cache invalidation: when mcp-server drops
             # its fallback cache, PG already serves the fresh entries. Only the
