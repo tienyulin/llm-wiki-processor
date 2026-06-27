@@ -240,3 +240,25 @@ async def test_recompile_refreshes_from_snapshots():
     wiki = await storage.aget_json("wiki.json")
     # Entries are back after recompile, stamped with the recompiled version.
     assert wiki["apis"]["flashback-api"]["POST /recover"]["source_version"] == "recompiled"
+
+
+async def test_modeb_module_collapses_to_source_app():
+    """A real LLM may name the module differently from source_app; the processor
+    must re-key endpoints under source_app (the per-app model, like the OpenAPI
+    path and the mock LLM)."""
+    from services.processor import WikiProcessor, _app_key
+
+    class _StubLLM:
+        async def generate_wiki(self, markdowns, source_app=None):
+            return {"apis": {"payments": {"POST /pay": {
+                "method": "POST", "path": "/pay", "description": "扣款"}}}}
+        async def generate_overview(self, app, apis):
+            return f"{app} overview"
+
+    proc = WikiProcessor(storage=_FakeStorage(), llm=_StubLLM())
+    md = {"README.md": "---\ntype: api\nsource_app: payments-svc\n---\n# 金流\n扣款。\nPOST /pay 扣款"}
+    r = await proc.process(md, "t", source_app="payments-svc", source_version="v1")
+    assert r.status == "success"
+    obj, _ = await proc.storage.aget_json_with_etag(_app_key("payments-svc"))
+    assert set(obj["apis"].keys()) == {"payments-svc"}, obj["apis"].keys()
+    assert "POST /pay" in obj["apis"]["payments-svc"]

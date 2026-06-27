@@ -616,6 +616,16 @@ class WikiProcessor(VectorSyncMixin):
                     )
 
                 new_apis = self._stamp(generated.get("apis", {}), app, version)
+                # Keep module == source_app (the per-app model; the OpenAPI path
+                # and the mock LLM already do this). A real LLM may invent its own
+                # module name (e.g. "payments" for source_app "payments-svc"),
+                # which splits an app's endpoints under an unexpected key and
+                # breaks grouping/filtering by app. Collapse them under this app.
+                if source_app:
+                    collapsed: dict = {}
+                    for endpoints in new_apis.values():
+                        collapsed.update(endpoints)
+                    new_apis = {app: collapsed}
                 for endpoints in new_apis.values():
                     for detail in endpoints.values():
                         if fm_tags:
