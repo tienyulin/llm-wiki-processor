@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    env:
+      MOCK_LLM: "true"
+      MOCK_EMBEDDINGS: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: black
+        run: black --check .
+      - name: flake8
+        run: flake8 .
+      - name: mypy
+        run: mypy .
+      - name: pylint
+        run: pylint $(find . -name "*.py")
+      - name: pytest
+        run: pytest -q
