@@ -23,11 +23,20 @@ Request：
 }
 ```
 
-**文件型別。** `doc_type` 決定抽取方式：
-- `api` —— 把 endpoint 抽進 `wiki.apis`（預設行為）。
-- `knowledge` —— 從**散文/參考文件**（如 Oracle、FastAPI how-to）抽出結構化條目
-  （title、summary、topics、key_points）進 `wiki.knowledge`，讓 wiki 也裝 agent 能推理的通用知識。
-- 省略 → **自動判斷**：含 HTTP endpoint 的推送為 `api`，否則 `knowledge`。
+**文件型別。** 推送解析為兩種 kind —— `api` 或 `knowledge`，決定抽取方式：
+- `api` —— 把 endpoint 抽進 `wiki.apis`。
+- `knowledge` —— 從**散文/參考文件**（如 Oracle、FastAPI how-to、cronjob/worker 元件 README）抽出結構化條目
+  （title、summary、topics、key_points、`doc_type`、`tags`）進 `wiki.knowledge`，讓 wiki 也裝 agent 能推理的通用知識。
+
+**判定優先序（type 權威，heuristic 只是最後手段）：**
+1. 明確的 `doc_type`（請求欄位）—— 正規化後只看是不是 `api`（不分大小寫）；其餘一律 `knowledge`。
+2. 附了 `openapi` spec → `api`（確定性匯入）。
+3. 來源文件 frontmatter 的 `type` —— **有宣告就權威**：只有 `type: api` 是 api，
+   其餘宣告型別（`tutorial`/`how-to`/`reference`/`explanation`，或 cronjob/worker 用的 `reference`）都是 `knowledge`。
+4. **都沒宣告**時才用內容 heuristic：散文中（程式碼區塊外）出現 `METHOD /path` → `api`，否則 `knowledge`。
+
+→ 因此 wiki-doc-author 產的合規文件（一定帶受控 `type`）永遠走宣告，不會被散文中順帶出現的
+endpoint 句子誤判；heuristic 僅服務沒有 frontmatter 的舊文件。
 
 知識條目帶同樣的 `sources`/`source_app`/`source_version` 出處；提到某概念 token 的知識文件
 （如 Oracle「flashback」文件寫了「recover」）會被 `/admin/rebuild-concepts` 連到該概念
