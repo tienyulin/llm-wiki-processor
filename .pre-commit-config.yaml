@@ -25,3 +25,11 @@ repos:
         entry: pylint
         language: system
         types: [python]
+      # Full test suite runs at push time only (too slow for every commit).
+      - id: pytest
+        name: pytest
+        entry: bash -c 'MOCK_LLM=true MOCK_EMBEDDINGS=true pytest -q'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
