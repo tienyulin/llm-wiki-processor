@@ -16,7 +16,12 @@ import httpx
 
 from ..base import LLMProvider
 from ..config import LLMConfig
-from ..exceptions import APIException, AuthenticationException, RateLimitException, ValidationException
+from ..exceptions import (
+    APIException,
+    AuthenticationException,
+    RateLimitException,
+    ValidationException,
+)
 from ..factory import LLMProviderFactory
 
 logger = logging.getLogger(__name__)
@@ -26,7 +31,7 @@ class OpenAICompatibleProvider(LLMProvider):
     """Provider for services with OpenAI-compatible /v1/chat/completions API."""
 
     def __init__(self, config: LLMConfig):
-        self.config = config
+        super().__init__(config)
         self.base_url = (config.base_url or "http://localhost:8000").rstrip("/")
         self.mock_mode = os.getenv("MOCK_LLM", "false").lower() == "true"
         if self.mock_mode:
@@ -73,12 +78,10 @@ class OpenAICompatibleProvider(LLMProvider):
                 result = response.json()
                 return result["choices"][0]["message"]["content"]
 
-            except (AuthenticationException, RateLimitException):
-                raise
             except (KeyError, json.JSONDecodeError) as e:
-                raise ValidationException(f"Unexpected response format: {e}")
+                raise ValidationException(f"Unexpected response format: {e}") from e
             except httpx.HTTPStatusError as e:
-                raise APIException(f"API error: {e}")
+                raise APIException(f"API error: {e}") from e
 
     async def validate_config(self) -> bool:
         if self.mock_mode:
@@ -102,8 +105,8 @@ class OpenAICompatibleProvider(LLMProvider):
                 return True
         except AuthenticationException:
             raise
-        except Exception as e:
-            logger.error(f"OpenAICompatibleProvider validation failed: {e}")
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.error("OpenAICompatibleProvider validation failed: %s", e)
             return False
 
     def get_model_info(self) -> Dict[str, Any]:
@@ -114,6 +117,7 @@ class OpenAICompatibleProvider(LLMProvider):
             "max_context": 4096,
             "supports_streaming": True,
         }
+
 
 # Register with factory
 LLMProviderFactory.register("openai-compatible", OpenAICompatibleProvider)

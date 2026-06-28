@@ -5,6 +5,7 @@ CAS write — embedding or PG failures degrade (NULL vectors / audit flag) but
 never fail the wiki write; processors without a vector store behave exactly
 as before the layer existed.
 """
+
 import pytest
 
 from services.embeddings import EmbeddingClient, EmbeddingConfig
@@ -15,6 +16,8 @@ _DIM = 16
 
 
 class FakeVectorStore:
+    """In-memory stand-in recording the vector-store calls the processor makes."""
+
     def __init__(self, fail=False):
         self.fail = fail
         self.schema_calls = 0
@@ -23,28 +26,35 @@ class FakeVectorStore:
         self.dim = _DIM
 
     async def ensure_schema_once(self):
+        """Record a schema-bootstrap call."""
         self.schema_calls += 1
 
     async def replace_app_entries(self, source_app, source_version, rows, synced_at):
+        """Record a per-app replace; raise if configured to fail."""
         if self.fail:
             raise ConnectionError("pg is down")
         self.replace_calls.append((source_app, source_version, rows, synced_at))
         return True
 
     async def rebuild(self, apps, versions):
+        """Record a full rebuild and return the row count."""
         self.rebuilds.append((apps, versions))
         return sum(len(rows) for rows in apps.values())
 
 
 class FailingEmbedder(EmbeddingClient):
+    """Embedder whose aembed always raises, to drive the degrade path."""
+
     def __init__(self):
         super().__init__(EmbeddingConfig(mock_mode=True, dim=_DIM))
 
     async def aembed(self, texts):
+        """Always fail, simulating an unreachable embeddings endpoint."""
         raise ConnectionError("embeddings endpoint unreachable")
 
 
 def make_vector_processor(storage, vector_store, embedder="mock"):
+    """A WikiProcessor wired to the given storage, embedder, and vector store."""
     base = make_processor(storage)
     if embedder == "mock":
         embedder = EmbeddingClient(EmbeddingConfig(mock_mode=True, dim=_DIM))
@@ -54,6 +64,7 @@ def make_vector_processor(storage, vector_store, embedder="mock"):
 
 
 async def test_sync_called_with_embedded_rows():
+    """A successful process() embeds each entry and syncs it to the store."""
     storage = InMemoryCASStorage()
     store = FakeVectorStore()
     processor = make_vector_processor(storage, store)
@@ -78,6 +89,7 @@ async def test_sync_called_with_embedded_rows():
 
 
 async def test_embedder_failure_degrades_to_null_vectors():
+    """An embedder failure still syncs rows, but with NULL vectors."""
     storage = InMemoryCASStorage()
     store = FakeVectorStore()
     processor = make_vector_processor(storage, store, embedder=FailingEmbedder())
@@ -87,11 +99,12 @@ async def test_embedder_failure_degrades_to_null_vectors():
     )
     assert result.status == "success"  # wiki write unaffected
 
-    (_, _, rows, _) = store.replace_calls[0]
+    _, _, rows, _ = store.replace_calls[0]
     assert all(r["embedding"] is None for r in rows)  # synced relationally
 
 
 async def test_store_failure_keeps_wiki_success_and_flags_audit():
+    """A store failure leaves the wiki write successful but flags the audit log."""
     storage = InMemoryCASStorage()
     processor = make_vector_processor(storage, FakeVectorStore(fail=True))
 
@@ -106,6 +119,7 @@ async def test_store_failure_keeps_wiki_success_and_flags_audit():
 
 
 async def test_no_vector_store_means_no_index_activity():
+    """Without a vector store, process() behaves as before the index existed."""
     storage = InMemoryCASStorage()
     processor = make_processor(storage)  # embedder/vector_store default to None
 
@@ -117,6 +131,7 @@ async def test_no_vector_store_means_no_index_activity():
 
 
 async def test_unchanged_resubmission_skips_sync():
+    """Re-submitting identical markdown takes the no-change path and skips sync."""
     storage = InMemoryCASStorage()
     store = FakeVectorStore()
     processor = make_vector_processor(storage, store)
@@ -128,6 +143,7 @@ async def test_unchanged_resubmission_skips_sync():
 
 
 async def test_reindex_rebuilds_from_wiki():
+    """reindex() rebuilds the whole index from wiki.json across all apps."""
     storage = InMemoryCASStorage()
     store = FakeVectorStore()
     processor = make_vector_processor(storage, store)
@@ -138,13 +154,15 @@ async def test_reindex_rebuilds_from_wiki():
     result = await processor.reindex()
     assert result == {"apps": 2, "entries": 2, "embedded": 2}
 
-    (apps, versions), = store.rebuilds
+    assert len(store.rebuilds) == 1
+    apps, versions = store.rebuilds[0]
     assert set(apps) == {"app-a", "app-b"}
     assert versions == {"app-a": "v1", "app-b": "v2"}
     assert apps["app-a"][0]["embedding"] is not None
 
 
 async def test_reindex_without_store_raises():
+    """reindex() without a configured vector store raises RuntimeError."""
     processor = make_processor(InMemoryCASStorage())
     with pytest.raises(RuntimeError, match="PG_DSN"):
         await processor.reindex()

@@ -1,7 +1,10 @@
 """P1: LLM rate-limit backoff. A concurrent fleet got 429s and ~65% of ingests
 failed; _generate_retry turns transient rate-limit/timeout errors into
 slightly-slower successes."""
-import os
+
+# pylint: disable=protected-access  # tests exercise the internal _generate_retry
+# pylint: disable=super-init-not-called  # stub provider skips the real provider init
+
 import pytest
 
 from services.llm.base import LLMProvider
@@ -10,6 +13,7 @@ from services.llm.exceptions import RateLimitException, APIException
 
 class _FlakyProvider(LLMProvider):
     """Raises `fail_times` rate-limit errors, then returns 'ok'."""
+
     def __init__(self, fail_times: int, exc=RateLimitException):
         self.calls = 0
         self._fail = fail_times
@@ -21,8 +25,11 @@ class _FlakyProvider(LLMProvider):
             raise self._exc("boom")
         return "ok"
 
-    async def validate_config(self): return True
-    def get_model_info(self): return {}
+    async def validate_config(self):
+        return True
+
+    def get_model_info(self):
+        return {}
 
 
 @pytest.fixture(autouse=True)
@@ -32,17 +39,20 @@ def _fast_retry(monkeypatch):
 
 
 async def test_retries_then_succeeds():
+    """Transient rate-limit errors are retried until a call succeeds."""
     p = _FlakyProvider(fail_times=2)
     assert await p._generate_retry("x") == "ok"
     assert p.calls == 3  # 2 failures + 1 success
 
 
 async def test_timeout_errors_also_retried():
+    """Timeout/APIException is treated as transient and retried too."""
     p = _FlakyProvider(fail_times=1, exc=APIException)
     assert await p._generate_retry("x") == "ok"
 
 
 async def test_reraises_after_exhausting(monkeypatch):
+    """Once retries are exhausted the last error propagates."""
     monkeypatch.setenv("LLM_MAX_RETRIES", "2")
     p = _FlakyProvider(fail_times=99)
     with pytest.raises(RateLimitException):

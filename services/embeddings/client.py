@@ -8,6 +8,7 @@ exception vocabulary as LLM calls.
 
 import json
 import logging
+from typing import Any
 
 import httpx
 
@@ -33,6 +34,7 @@ class EmbeddingClient:
             logger.warning("EmbeddingClient: running in MOCK mode")
 
     def is_enabled(self) -> bool:
+        """True when embeddings are usable (mock mode or a configured base URL)."""
         return self.config.is_enabled()
 
     def _headers(self) -> dict:
@@ -58,13 +60,13 @@ class EmbeddingClient:
         vectors: list[list[float]] = []
         async with httpx.AsyncClient(timeout=float(self.config.timeout_seconds)) as client:
             for start in range(0, len(texts), self.config.batch_size):
-                chunk = texts[start:start + self.config.batch_size]
+                chunk = texts[start : start + self.config.batch_size]
                 vectors.extend(await self._embed_chunk(client, chunk))
         return vectors
 
     async def _embed_chunk(self, client: httpx.AsyncClient, chunk: list[str]) -> list[list[float]]:
         url = f"{self.config.base_url}/v1/embeddings"
-        body = {"model": self.config.model, "input": chunk}
+        body: dict[str, Any] = {"model": self.config.model, "input": chunk}
         if self.config.send_dimensions:
             body["dimensions"] = self.config.dim
         try:
@@ -86,12 +88,12 @@ class EmbeddingClient:
             # back to that.
             ordered = sorted(data, key=lambda item: item.get("index", 0))
             vectors = [item["embedding"] for item in ordered]
-        except (AuthenticationException, RateLimitException):
-            raise
+        # AuthenticationException / RateLimitException raised above are distinct
+        # types from the handlers below, so they already propagate unchanged.
         except (KeyError, TypeError, json.JSONDecodeError) as e:
-            raise ValidationException(f"Unexpected embeddings response format: {e}")
+            raise ValidationException(f"Unexpected embeddings response format: {e}") from e
         except httpx.HTTPStatusError as e:
-            raise APIException(f"Embeddings API error: {e}")
+            raise APIException(f"Embeddings API error: {e}") from e
 
         if len(vectors) != len(chunk):
             raise ValidationException(

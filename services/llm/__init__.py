@@ -25,7 +25,9 @@ from .exceptions import (
     ValidationException,
 )
 
-# Import providers to trigger factory registration
+# Import providers LAST to trigger factory registration — must follow the base/
+# factory definitions above, so the import-order/position warnings are expected.
+# pylint: disable=wrong-import-order,wrong-import-position
 import services.llm.providers  # noqa: F401
 
 __all__ = [

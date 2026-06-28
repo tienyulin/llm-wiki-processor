@@ -1,9 +1,12 @@
-from typing import Optional
+"""Pydantic request/response schemas for the wiki-processor HTTP API."""
+
+from typing import Any, Optional
 from pydantic import BaseModel, field_validator
 
 
 class ProcessRequest(BaseModel):
     """Request body for /process endpoint"""
+
     markdowns: dict[str, str]  # {filename: content}
     timestamp: str
     trigger_info: dict
@@ -15,6 +18,7 @@ class ProcessRequest(BaseModel):
     @field_validator("markdowns")
     @classmethod
     def markdowns_must_not_be_empty(cls, v: dict[str, str]) -> dict[str, str]:
+        """Reject an empty markdowns map so /process always has input to ingest."""
         if not v:
             raise ValueError("markdowns must contain at least one file")
         return v
@@ -22,6 +26,7 @@ class ProcessRequest(BaseModel):
 
 class ProcessResponse(BaseModel):
     """Response from /process endpoint"""
+
     status: str  # "success" | "partial" | "failed"
     message: str
     wiki_url: Optional[str] = None
@@ -34,6 +39,8 @@ class ProcessResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
+    """Response from the /health endpoint."""
+
     status: str
     minio_connected: bool
     llm_configured: bool
@@ -44,6 +51,7 @@ class HealthResponse(BaseModel):
     # Backward-compat alias (mirrors llm_configured)
     minimax_accessible: Optional[bool] = None
 
-    def model_post_init(self, __context):
+    def model_post_init(self, context: Any, /) -> None:
+        """Default the backward-compat minimax_accessible alias to llm_configured."""
         if self.minimax_accessible is None:
             self.minimax_accessible = self.llm_configured

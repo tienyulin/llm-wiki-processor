@@ -17,10 +17,13 @@ from services.llm import LLMConfig, load_from_env
 
 @dataclass(frozen=True)
 class Settings:
+    """Process-wide settings composing the per-domain config loaders."""
+
     llm: LLMConfig
     embeddings: EmbeddingConfig
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    """Return the cached process-wide Settings, read from the environment."""
     return Settings(llm=load_from_env(), embeddings=load_embedding_env())

@@ -9,8 +9,13 @@ WikiProcessor — `self.vector_store`, `self.embedder`, `self.storage`,
 
 import logging
 from datetime import datetime
+from typing import TYPE_CHECKING, Optional
 
 from services.embeddings import entry_to_text, knowledge_to_text
+
+if TYPE_CHECKING:  # pragma: no cover - typing-only imports
+    from repository.pg_store import PGVectorStore
+    from services.embeddings import EmbeddingClient
 
 logger = logging.getLogger(__name__)
 
@@ -19,22 +24,44 @@ _SYSTEM_APP = "system"
 
 
 class VectorSyncMixin:
-    """PG/pgvector index sync (api + knowledge). Optional; best-effort."""
+    """PG/pgvector index sync (api + knowledge). Optional; best-effort.
+
+    Host-class collaborators (provided by WikiProcessor) are declared below as
+    annotations so type checkers resolve them; they are not assigned here.
+    """
+
+    # Provided by the host class (WikiProcessor.__init__ / methods).
+    embedder: "Optional[EmbeddingClient]"
+    vector_store: "Optional[PGVectorStore]"
+
+    async def _log_audit(
+        self, source_app: str, files_count: int, status: str, files_updated: list
+    ) -> None:
+        """Provided by the host class; declared for type resolution."""
+        raise NotImplementedError
+
+    async def aggregate_apps(self) -> dict:
+        """Provided by the host class; declared for type resolution."""
+        raise NotImplementedError
 
     def _entry_rows(self, new_apis: dict) -> list[dict]:
         """Flatten stamped entries into api_entries rows (without vectors)."""
         rows = []
         for module, endpoints in new_apis.items():
             for api_key, detail in endpoints.items():
-                rows.append({
-                    "module": module,
-                    "api_key": api_key,
-                    "description": detail.get("description", "") if isinstance(detail, dict) else "",
-                    "detail": detail,
-                    "embed_text": entry_to_text(module, api_key, detail),
-                    "embedding": None,
-                    "embedding_model": None,
-                })
+                rows.append(
+                    {
+                        "module": module,
+                        "api_key": api_key,
+                        "description": (
+                            detail.get("description", "") if isinstance(detail, dict) else ""
+                        ),
+                        "detail": detail,
+                        "embed_text": entry_to_text(module, api_key, detail),
+                        "embedding": None,
+                        "embedding_model": None,
+                    }
+                )
         return rows
 
     async def _embed_rows(self, app: str, rows: list[dict]):
@@ -47,10 +74,14 @@ class VectorSyncMixin:
             for row, vec in zip(rows, vectors):
                 row["embedding"] = vec
                 row["embedding_model"] = self.embedder.config.model
-        except Exception as e:
-            logger.warning(f"Embedding failed for {app}, syncing without vectors: {e}")
+        # Embeddings are best-effort: any provider error degrades to NULL
+        # vectors rather than failing the sync.
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.warning("Embedding failed for %s, syncing without vectors: %s", app, e)
 
-    async def _sync_vector_index(self, app: str, version: str, rows: list[dict], synced_at: datetime):
+    async def _sync_vector_index(
+        self, app: str, version: str, rows: list[dict], synced_at: datetime
+    ):
         """Best-effort PG sync after a successful CAS write.
 
         Failure never propagates — the wiki write already succeeded. It is
@@ -61,26 +92,32 @@ class VectorSyncMixin:
             await self.vector_store.ensure_schema_once()
             applied = await self.vector_store.replace_app_entries(app, version, rows, synced_at)
             if not applied:
-                logger.info(f"PG index sync for {app} superseded by a newer sync, skipped")
-        except Exception as e:
-            logger.warning(f"PG index sync failed for {app} (wiki write succeeded): {e}")
+                logger.info("PG index sync for %s superseded by a newer sync, skipped", app)
+        # Best-effort: the wiki write already succeeded, so any PG failure is
+        # logged + audited for /admin/reindex repair, never propagated.
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.warning("PG index sync failed for %s (wiki write succeeded): %s", app, e)
             await self._log_audit(app, len(rows), "success_index_sync_failed", [])
 
     def _knowledge_rows(self, new_knowledge: dict) -> list[dict]:
         """Flatten knowledge entries into knowledge_entries rows (no vectors yet)."""
         rows = []
         for doc_id, entry in new_knowledge.items():
-            rows.append({
-                "doc_id": doc_id,
-                "title": entry.get("title", "") if isinstance(entry, dict) else "",
-                "detail": entry,
-                "embed_text": knowledge_to_text(doc_id, entry),
-                "embedding": None,
-                "embedding_model": None,
-            })
+            rows.append(
+                {
+                    "doc_id": doc_id,
+                    "title": entry.get("title", "") if isinstance(entry, dict) else "",
+                    "detail": entry,
+                    "embed_text": knowledge_to_text(doc_id, entry),
+                    "embedding": None,
+                    "embedding_model": None,
+                }
+            )
         return rows
 
-    async def _sync_knowledge_index(self, app: str, version: str, rows: list[dict], synced_at: datetime):
+    async def _sync_knowledge_index(
+        self, app: str, version: str, rows: list[dict], synced_at: datetime
+    ):
         """Best-effort PG sync of knowledge entries (hybrid search index).
         Same fail-safe contract as _sync_vector_index."""
         if self.vector_store is None:
@@ -89,9 +126,11 @@ class VectorSyncMixin:
             await self.vector_store.ensure_schema_once()
             applied = await self.vector_store.replace_app_knowledge(app, version, rows, synced_at)
             if not applied:
-                logger.info(f"PG knowledge sync for {app} superseded by a newer sync, skipped")
-        except Exception as e:
-            logger.warning(f"PG knowledge sync failed for {app} (wiki write succeeded): {e}")
+                logger.info("PG knowledge sync for %s superseded by a newer sync, skipped", app)
+        # Same best-effort contract as _sync_vector_index: log + audit, never
+        # propagate, repair via /admin/reindex.
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.warning("PG knowledge sync failed for %s (wiki write succeeded): %s", app, e)
             await self._log_audit(app, len(rows), "success_index_sync_failed", [])
 
     async def reindex(self) -> dict:
@@ -110,8 +149,19 @@ class VectorSyncMixin:
             if not isinstance(endpoints, dict):
                 continue
             for api_key, detail in endpoints.items():
-                app = detail.get("source_app", _SYSTEM_APP) if isinstance(detail, dict) else _SYSTEM_APP
-                versions.setdefault(app, detail.get("source_version", "unknown") if isinstance(detail, dict) else "unknown")
+                app = (
+                    detail.get("source_app", _SYSTEM_APP)
+                    if isinstance(detail, dict)
+                    else _SYSTEM_APP
+                )
+                versions.setdefault(
+                    app,
+                    (
+                        detail.get("source_version", "unknown")
+                        if isinstance(detail, dict)
+                        else "unknown"
+                    ),
+                )
                 apps.setdefault(app, []).extend(self._entry_rows({module: {api_key: detail}}))
 
         for app, rows in apps.items():

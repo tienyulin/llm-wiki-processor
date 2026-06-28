@@ -19,7 +19,12 @@ import httpx
 
 from ..base import LLMProvider
 from ..config import LLMConfig
-from ..exceptions import APIException, AuthenticationException, RateLimitException, ValidationException
+from ..exceptions import (
+    APIException,
+    AuthenticationException,
+    RateLimitException,
+    ValidationException,
+)
 from ..factory import LLMProviderFactory
 
 logger = logging.getLogger(__name__)
@@ -31,7 +36,7 @@ class AzureOpenAIProvider(LLMProvider):
     """Azure OpenAI LLM provider."""
 
     def __init__(self, config: LLMConfig):
-        self.config = config
+        super().__init__(config)
         resource_url = (config.base_url or "").rstrip("/")
         api_version = os.getenv("AZURE_API_VERSION", _DEFAULT_API_VERSION)
         deployment = config.model
@@ -73,12 +78,10 @@ class AzureOpenAIProvider(LLMProvider):
                 result = response.json()
                 return result["choices"][0]["message"]["content"]
 
-            except (AuthenticationException, RateLimitException):
-                raise
             except (KeyError, json.JSONDecodeError) as e:
-                raise ValidationException(f"Unexpected Azure OpenAI response: {e}")
+                raise ValidationException(f"Unexpected Azure OpenAI response: {e}") from e
             except httpx.HTTPStatusError as e:
-                raise APIException(f"Azure OpenAI API error: {e}")
+                raise APIException(f"Azure OpenAI API error: {e}") from e
 
     async def validate_config(self) -> bool:
         try:
@@ -98,8 +101,8 @@ class AzureOpenAIProvider(LLMProvider):
                 return True
         except AuthenticationException:
             raise
-        except Exception as e:
-            logger.error(f"AzureOpenAIProvider validation failed: {e}")
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.error("AzureOpenAIProvider validation failed: %s", e)
             return False
 
     def get_model_info(self) -> Dict[str, Any]:
@@ -109,6 +112,7 @@ class AzureOpenAIProvider(LLMProvider):
             "max_context": 128000,
             "supports_streaming": True,
         }
+
 
 # Register with factory
 LLMProviderFactory.register("azure", AzureOpenAIProvider)

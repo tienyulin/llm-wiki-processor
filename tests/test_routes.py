@@ -3,10 +3,10 @@
 Singletons are provided lazily via core.deps; tests inject mocks with
 app.dependency_overrides (cleared by the autouse fixture in conftest.py).
 """
+
 from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
 from fastapi.testclient import TestClient
 
 from core import deps
@@ -18,6 +18,7 @@ client = TestClient(app)
 
 @contextmanager
 def override(dep, replacement):
+    """Context manager that overrides a FastAPI dependency, restoring it on exit."""
     app.dependency_overrides[dep] = lambda: replacement
     try:
         yield replacement
@@ -27,12 +28,14 @@ def override(dep, replacement):
 
 @contextmanager
 def mock_processor_override():
+    """Override get_processor with a MagicMock processor for the duration."""
     mock_processor = MagicMock()
     with override(deps.get_processor, mock_processor):
         yield mock_processor
 
 
 def test_health_returns_200_with_expected_keys():
+    """/health returns 200 with all status fields incl. the backward-compat alias."""
     mock_storage = MagicMock()
     mock_storage.ping.return_value = True
     with override(deps.get_storage, mock_storage):
@@ -52,6 +55,7 @@ def test_health_returns_200_with_expected_keys():
 
 
 def test_status_returns_expected_shape():
+    """/status reports wiki size, tracked files, and last-updated from storage."""
     fake_wiki = {
         "apis": {"users": {}, "orders": {}},
         "metadata": {"updated_at": "2024-01-01T00:00:00"},
@@ -74,6 +78,7 @@ def test_status_returns_expected_shape():
 
 
 def test_process_returns_200_and_response_body():
+    """/process returns the processor's ProcessResponse body on success."""
     fake_response = ProcessResponse(
         status="success",
         message="Wiki generated successfully",
@@ -101,6 +106,7 @@ def test_process_returns_200_and_response_body():
 
 
 def test_process_rejects_empty_markdowns():
+    """/process rejects an empty markdowns map with 422."""
     resp = client.post(
         "/process",
         json={
@@ -120,6 +126,7 @@ _PAYLOAD = {
 
 
 def test_process_requires_api_key_when_configured(monkeypatch):
+    """/process returns 401 for a missing or wrong key when one is configured."""
     monkeypatch.setenv("PROCESSOR_API_KEY", "secret-key")
 
     # Missing header
@@ -130,9 +137,12 @@ def test_process_requires_api_key_when_configured(monkeypatch):
 
 
 def test_process_accepts_valid_api_key(monkeypatch):
+    """/process accepts the correct X-API-Key when one is configured."""
     monkeypatch.setenv("PROCESSOR_API_KEY", "secret-key")
     fake_response = ProcessResponse(
-        status="success", message="ok", timestamp="2024-01-01T00:00:00",
+        status="success",
+        message="ok",
+        timestamp="2024-01-01T00:00:00",
     )
     with mock_processor_override() as mock_processor:
         mock_processor.process = AsyncMock(return_value=fake_response)
@@ -141,6 +151,7 @@ def test_process_accepts_valid_api_key(monkeypatch):
 
 
 def test_reindex_503_when_pg_disabled(monkeypatch):
+    """/admin/reindex returns 503 when the vector store is disabled."""
     monkeypatch.delenv("PROCESSOR_API_KEY", raising=False)
     resp = client.post("/admin/reindex")
     assert resp.status_code == 503
@@ -148,25 +159,28 @@ def test_reindex_503_when_pg_disabled(monkeypatch):
 
 
 def test_reindex_requires_api_key(monkeypatch):
+    """/admin/reindex returns 401 without the configured API key."""
     monkeypatch.setenv("PROCESSOR_API_KEY", "secret-key")
     assert client.post("/admin/reindex").status_code == 401
 
 
 def test_reindex_runs_when_pg_enabled():
+    """/admin/reindex runs and echoes the reindex result when PG is enabled."""
     with mock_processor_override() as mock_processor:
         mock_processor.vector_store = MagicMock()  # not None => enabled
-        mock_processor.reindex = AsyncMock(
-            return_value={"apps": 2, "entries": 5, "embedded": 5}
-        )
+        mock_processor.reindex = AsyncMock(return_value={"apps": 2, "entries": 5, "embedded": 5})
         resp = client.post("/admin/reindex")
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok", "apps": 2, "entries": 5, "embedded": 5}
 
 
 def test_process_open_when_auth_disabled(monkeypatch):
+    """/process is open (200) when no PROCESSOR_API_KEY is configured."""
     monkeypatch.delenv("PROCESSOR_API_KEY", raising=False)
     fake_response = ProcessResponse(
-        status="success", message="ok", timestamp="2024-01-01T00:00:00",
+        status="success",
+        message="ok",
+        timestamp="2024-01-01T00:00:00",
     )
     with mock_processor_override() as mock_processor:
         mock_processor.process = AsyncMock(return_value=fake_response)
