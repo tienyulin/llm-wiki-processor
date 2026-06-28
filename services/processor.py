@@ -1,6 +1,7 @@
 """Wiki-processing pipeline: extraction, app-level merge, and CAS persistence."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -425,29 +426,53 @@ class WikiProcessor(VectorSyncMixin):
         merged_apis: dict = {}
         merged_knowledge: dict = {}
         overviews: dict = {}
+        app_versions: dict = {}
         for key in await self.storage.alist_files(_APP_PREFIX):
             if not key.endswith(".json"):
                 continue
             obj = await self.storage.aget_json(key) or {}
+            # Per-app updated_at is bumped on every successful push; the set of
+            # {app: updated_at} is a cheap fingerprint of the inputs, so a rebuild
+            # can tell whether anything changed without re-running the LLM.
+            app_versions[key] = obj.get("updated_at", "")
             for module, endpoints in (obj.get("apis") or {}).items():
                 merged_apis.setdefault(module, {}).update(endpoints)
             merged_knowledge.update(obj.get("knowledge") or {})
             app = obj.get("source_app")
             if app and obj.get("overview") is not None:
                 overviews[app] = {"text": obj["overview"], "updated_at": obj.get("updated_at", "")}
+        fingerprint = hashlib.sha256(
+            json.dumps(app_versions, sort_keys=True).encode("utf-8")
+        ).hexdigest()
         return {
             "schema_version": _SCHEMA_VERSION,
             "apis": merged_apis,
             "knowledge": merged_knowledge,
             "overviews": overviews,
+            "source_fingerprint": fingerprint,
         }
 
     async def rebuild_concepts(self) -> dict:
         """Rebuild the derived aggregate wiki.json from the per-app objects:
         merge all apps, synthesize concepts, write wiki.json (the view mcp reads
         for concepts/overviews + fallback). Run after a batch of pushes or on a
-        schedule — the per-push hot path no longer touches this aggregate."""
+        schedule — the per-push hot path no longer touches this aggregate.
+
+        Idempotent when idle: the per-app fingerprint is stored in wiki.json's
+        metadata, and a rebuild whose inputs are unchanged returns early
+        (``changed=False``) WITHOUT the whole-wiki LLM concept synthesis — so a
+        periodic cron trigger is cheap when nothing has been pushed."""
         agg = await self.aggregate_apps()
+        fingerprint = agg.pop("source_fingerprint")
+        existing = await self.storage.aget_json(_WIKI_KEY) or {}
+        if existing and existing.get("metadata", {}).get("source_fingerprint") == fingerprint:
+            logger.info("rebuild-concepts: inputs unchanged, skipping LLM synthesis")
+            return {
+                "changed": False,
+                "concepts": len(existing.get("concepts", {})),
+                "apps": len(agg["overviews"]),
+                "endpoints": sum(len(e) for e in agg["apis"].values()),
+            }
         concepts = await self.llm.generate_concepts(agg["apis"], knowledge=agg["knowledge"])
         # Augment substring links with semantic ones (embedding proximity) so a
         # synonym-phrased knowledge doc still links to its concept.
@@ -455,11 +480,16 @@ class WikiProcessor(VectorSyncMixin):
         wiki = {
             **agg,
             "concepts": concepts,
-            "metadata": {"version": "1.0", "updated_at": datetime.now().isoformat()},
+            "metadata": {
+                "version": "1.0",
+                "updated_at": datetime.now().isoformat(),
+                "source_fingerprint": fingerprint,
+            },
         }
         await self.storage.aput_json(_WIKI_KEY, wiki)
         await self._notify_cache_invalidation(None)
         return {
+            "changed": True,
             "concepts": len(concepts),
             "apps": len(agg["overviews"]),
             "endpoints": sum(len(e) for e in agg["apis"].values()),

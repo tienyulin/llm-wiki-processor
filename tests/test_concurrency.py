@@ -176,3 +176,36 @@ async def test_aggregate_apps_merges_all_objects():
     agg = await processor.aggregate_apps()
     assert "GET /app-a/items" in agg["apis"]["app-a"]
     assert "GET /app-b/items" in agg["apis"]["app-b"]
+
+
+async def test_rebuild_concepts_skips_when_unchanged():
+    """A rebuild whose inputs are unchanged returns changed=False and does NOT
+    re-run the LLM concept synthesis; a new push flips it back to changed=True."""
+    storage = InMemoryCASStorage()
+    processor = make_processor(storage)
+    await processor.process(app_markdown("app-a"), "t", source_app="app-a", source_version="v1")
+
+    calls = []
+    original = processor.llm.generate_concepts
+
+    async def _counting(*args, **kwargs):
+        calls.append(1)
+        return await original(*args, **kwargs)
+
+    processor.llm.generate_concepts = _counting
+
+    first = await processor.rebuild_concepts()
+    assert first["changed"] is True
+    assert len(calls) == 1
+
+    # nothing pushed since -> the second rebuild is a no-op (LLM not called again)
+    second = await processor.rebuild_concepts()
+    assert second["changed"] is False
+    assert len(calls) == 1
+    assert second["concepts"] == first["concepts"]
+
+    # a new app changes the fingerprint -> rebuild runs the LLM again
+    await processor.process(app_markdown("app-b"), "t", source_app="app-b", source_version="v1")
+    third = await processor.rebuild_concepts()
+    assert third["changed"] is True
+    assert len(calls) == 2

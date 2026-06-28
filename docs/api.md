@@ -92,7 +92,13 @@ PG 關閉時（`PG_DSN` 空）回 503。
 
 ## `POST /admin/rebuild-concepts`
 跨應用概念合成，並重建**衍生彙總 `wiki.json`**（合併所有 app + concepts + overviews）。
-批次推送後或排程跑（非每次匯入 —— 它讀全部 app）。`{"status":"ok","concepts":N,...}`。
+批次推送後或排程跑（非每次匯入 —— 它讀全部 app）。
+`{"status":"ok","changed":true|false,"concepts":N,"apps":N,"endpoints":N}`。
+
+> **閒置時免費（idempotent）**：每次重建會把「各 app 的 `updated_at` 指紋」寫進 `wiki.json`
+> 的 `metadata.source_fingerprint`。下次呼叫先比指紋 —— **沒有任何 app 變動就直接回
+> `changed:false` 並跳過昂貴的全 wiki LLM 概念合成**。所以排程（例:cron 每 5 分鐘）打進來，
+> 沒人 push 時幾乎零成本,只有真的有新東西才做重建。
 
 > P3 後：每-app 物件 `apps/<app>.json` 是真相來源；彙總 `wiki.json`（給 mcp 讀 concepts/
 > overviews + fallback）由本端點按需重建。`wiki.json` 含 `overviews`、`concepts`、
