@@ -39,15 +39,19 @@ async def build_health(
         # Local config check only — validate_config() would make a live LLM
         # API call, and /health is polled.
         llm_ok = llm.is_configured()
-    except Exception as e:
-        logger.error(f"LLM health check failed: {e}")
+    # Health probe must never crash on a misbehaving provider check; any error
+    # just means "not OK".
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.error("LLM health check failed: %s", e)
 
     vector_ok = False
     if processor.vector_store is not None:
         try:
             vector_ok = await processor.vector_store.available()
-        except Exception as e:
-            logger.error(f"Vector index health check failed: {e}")
+        # Health probe must never crash on a vector-store error; treat any
+        # failure as "index not available".
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.error("Vector index health check failed: %s", e)
 
     return HealthResponse(
         status="ok" if minio_ok else "degraded",

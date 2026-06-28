@@ -6,7 +6,15 @@ must still be in place before the first request constructs the singletons.
 
 Tests inject mocks with app.dependency_overrides; the autouse fixture below
 clears overrides and cached singletons between tests.
+
+pylint: the autouse fixture imports app/deps lazily inside the function
+(import-outside-toplevel) so they are constructed only after the env/Minio
+stub above is in place — a deliberate pytest setup ordering.
 """
+
+# pylint: disable=import-outside-toplevel
+# pylint: disable=wrong-import-position  # Minio SDK must be stubbed before import
+
 import os
 from unittest.mock import MagicMock
 
@@ -23,7 +31,7 @@ os.environ["PG_DSN"] = ""
 # Stub the Minio SDK class so MinioStorage() never opens a connection.
 import repository.minio_client as _minio_client  # noqa: E402
 
-_minio_client.Minio = MagicMock()
+_minio_client.Minio = MagicMock()  # type: ignore[misc]
 
 
 @pytest.fixture(autouse=True)

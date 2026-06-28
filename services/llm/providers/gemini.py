@@ -7,8 +7,12 @@ from typing import Dict, Any, Optional
 import httpx
 
 from ..base import LLMProvider
-from ..config import LLMConfig
-from ..exceptions import APIException, AuthenticationException, RateLimitException, ValidationException
+from ..exceptions import (
+    APIException,
+    AuthenticationException,
+    RateLimitException,
+    ValidationException,
+)
 from ..factory import LLMProviderFactory
 
 logger = logging.getLogger(__name__)
@@ -22,9 +26,6 @@ class GeminiProvider(LLMProvider):
     Auth: API key passed as query parameter `?key=<api_key>`.
     Response: candidates[0].content.parts[0].text
     """
-
-    def __init__(self, config: LLMConfig):
-        self.config = config
 
     def _url(self) -> str:
         return f"{_API_BASE}/{self.config.model}:generateContent?key={self.config.api_key}"
@@ -65,12 +66,10 @@ class GeminiProvider(LLMProvider):
                 result = response.json()
                 return result["candidates"][0]["content"]["parts"][0]["text"]
 
-            except (AuthenticationException, RateLimitException):
-                raise
             except (KeyError, json.JSONDecodeError) as e:
-                raise ValidationException(f"Unexpected Gemini response: {e}")
+                raise ValidationException(f"Unexpected Gemini response: {e}") from e
             except httpx.HTTPStatusError as e:
-                raise APIException(f"Google Gemini API error: {e}")
+                raise APIException(f"Google Gemini API error: {e}") from e
 
     async def validate_config(self) -> bool:
         try:
@@ -92,8 +91,8 @@ class GeminiProvider(LLMProvider):
                 return True
         except AuthenticationException:
             raise
-        except Exception as e:
-            logger.error(f"GeminiProvider validation failed: {e}")
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.error("GeminiProvider validation failed: %s", e)
             return False
 
     def get_model_info(self) -> Dict[str, Any]:
@@ -103,6 +102,7 @@ class GeminiProvider(LLMProvider):
             "max_context": 1000000,
             "supports_streaming": True,
         }
+
 
 # Register with factory
 LLMProviderFactory.register("gemini", GeminiProvider)

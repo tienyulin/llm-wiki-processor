@@ -1,3 +1,5 @@
+"""ASGI entrypoint: builds the FastAPI app and warms the singletons at boot."""
+
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -15,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_app: FastAPI):
     """Warm up the dependency singletons so misconfiguration fails at boot,
     not on the first request. Tests use lazy construction instead (their
     TestClient does not run the lifespan)."""
@@ -29,9 +31,10 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Wiki Processor", version="0.1.0", lifespan=lifespan)
-    app.include_router(api_router)
-    return app
+    """Build and configure the FastAPI application."""
+    application = FastAPI(title="Wiki Processor", version="0.1.0", lifespan=lifespan)
+    application.include_router(api_router)
+    return application
 
 
 app = create_app()

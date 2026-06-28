@@ -7,8 +7,12 @@ from typing import Dict, Any, Optional
 import httpx
 
 from ..base import LLMProvider
-from ..config import LLMConfig
-from ..exceptions import APIException, AuthenticationException, RateLimitException, ValidationException
+from ..exceptions import (
+    APIException,
+    AuthenticationException,
+    RateLimitException,
+    ValidationException,
+)
 from ..factory import LLMProviderFactory
 
 logger = logging.getLogger(__name__)
@@ -18,9 +22,6 @@ _API_URL = "https://api.openai.com/v1/chat/completions"
 
 class OpenAIProvider(LLMProvider):
     """OpenAI (GPT) LLM provider."""
-
-    def __init__(self, config: LLMConfig):
-        self.config = config
 
     async def generate(
         self,
@@ -56,12 +57,10 @@ class OpenAIProvider(LLMProvider):
                 result = response.json()
                 return result["choices"][0]["message"]["content"]
 
-            except (AuthenticationException, RateLimitException):
-                raise
             except (KeyError, json.JSONDecodeError) as e:
-                raise ValidationException(f"Unexpected OpenAI response: {e}")
+                raise ValidationException(f"Unexpected OpenAI response: {e}") from e
             except httpx.HTTPStatusError as e:
-                raise APIException(f"OpenAI API error: {e}")
+                raise APIException(f"OpenAI API error: {e}") from e
 
     async def validate_config(self) -> bool:
         try:
@@ -82,8 +81,8 @@ class OpenAIProvider(LLMProvider):
                 return True
         except AuthenticationException:
             raise
-        except Exception as e:
-            logger.error(f"OpenAIProvider validation failed: {e}")
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.error("OpenAIProvider validation failed: %s", e)
             return False
 
     def get_model_info(self) -> Dict[str, Any]:
@@ -93,6 +92,7 @@ class OpenAIProvider(LLMProvider):
             "max_context": 128000,
             "supports_streaming": True,
         }
+
 
 # Register with factory
 LLMProviderFactory.register("openai", OpenAIProvider)

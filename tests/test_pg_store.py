@@ -8,6 +8,10 @@ automatically when nothing is listening on PG_TEST_DSN's first host
     docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=pg -e POSTGRES_DB=wiki \
         pgvector/pgvector:pg16
 """
+
+# pylint: disable=redefined-outer-name  # pytest fixtures injected by name
+# pylint: disable=protected-access  # test setup pokes the pool internals directly
+
 import os
 import socket
 from datetime import datetime, timedelta, timezone
@@ -32,9 +36,7 @@ def _pg_reachable() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(
-    not _pg_reachable(), reason=f"no Postgres server for {_DSN}"
-)
+pytestmark = pytest.mark.skipif(not _pg_reachable(), reason=f"no Postgres server for {_DSN}")
 
 
 def _rows(n=3, module="inventory", offset=0):
@@ -43,20 +45,23 @@ def _rows(n=3, module="inventory", offset=0):
         api_key = f"GET /{module}/thing{i}"
         detail = {"method": "GET", "path": f"/{module}/thing{i}", "description": f"Get thing {i}"}
         text = f"{module} | {api_key} | Get thing {i}"
-        rows.append({
-            "module": module,
-            "api_key": api_key,
-            "description": f"Get thing {i}",
-            "detail": detail,
-            "embed_text": text,
-            "embedding": mock_embed(text, _DIM),
-            "embedding_model": "mock",
-        })
+        rows.append(
+            {
+                "module": module,
+                "api_key": api_key,
+                "description": f"Get thing {i}",
+                "detail": detail,
+                "embed_text": text,
+                "embedding": mock_embed(text, _DIM),
+                "embedding_model": "mock",
+            }
+        )
     return rows
 
 
 @pytest.fixture
 async def store():
+    """A PGVectorStore with a freshly-dropped, freshly-bootstrapped schema."""
     s = PGVectorStore(_DSN, min_size=1, max_size=2)
     await s._ensure_open()
     async with s._pool.connection() as conn:
@@ -72,16 +77,19 @@ def _now():
 
 
 async def test_ensure_schema_idempotent(store):
+    """ensure_schema run twice is a no-op, not an error."""
     await store.ensure_schema(_DIM)  # second run must be a no-op
     assert await store.count_entries() == (0, 0)
 
 
 async def test_ensure_schema_rejects_dim_change(store):
+    """Changing the embedding dimension on an existing schema is rejected."""
     with pytest.raises(ConfigurationException, match="EMBEDDING_DIM"):
         await store.ensure_schema(_DIM * 2)
 
 
 async def test_replace_app_entries_roundtrip(store):
+    """Replacing an app's entries swaps in the new rows and drops the old."""
     assert await store.replace_app_entries("app-a", "v1", _rows(3), _now())
     assert await store.count_entries() == (3, 3)
 
@@ -92,6 +100,7 @@ async def test_replace_app_entries_roundtrip(store):
 
 
 async def test_replace_preserves_other_apps(store):
+    """Replacing one app's entries leaves other apps' rows untouched."""
     await store.replace_app_entries("app-a", "v1", _rows(2, module="inventory"), _now())
     await store.replace_app_entries("app-b", "v1", _rows(2, module="billing"), _now())
     await store.replace_app_entries("app-a", "v2", _rows(1, module="inventory", offset=5), _now())
@@ -111,6 +120,7 @@ async def test_key_ownership_transfer(store):
 
 
 async def test_stale_sync_rejected(store):
+    """A replay carrying an older timestamp must not clobber newer data."""
     now = _now()
     assert await store.replace_app_entries("app-a", "v2", _rows(2), now)
     # A replay carrying an older timestamp must not clobber newer data.
@@ -121,17 +131,24 @@ async def test_stale_sync_rejected(store):
 
 
 async def test_semantic_search_ordering(store):
+    """ANN search ranks the closest entry first with normalised scores."""
     rows = []
     for module, key, text in [
         ("inventory", "GET /inventory/health", "inventory health check status"),
         ("auth", "POST /auth/login", "user login authentication token"),
         ("billing", "GET /billing/invoice", "fetch invoice for billing account"),
     ]:
-        rows.append({
-            "module": module, "api_key": key, "description": text,
-            "detail": {"description": text}, "embed_text": text,
-            "embedding": mock_embed(text, _DIM), "embedding_model": "mock",
-        })
+        rows.append(
+            {
+                "module": module,
+                "api_key": key,
+                "description": text,
+                "detail": {"description": text},
+                "embed_text": text,
+                "embedding": mock_embed(text, _DIM),
+                "embedding_model": "mock",
+            }
+        )
     await store.replace_app_entries("app-a", "v1", rows, _now())
 
     results = await store.semantic_search(mock_embed("inventory health", _DIM), top_k=3)
@@ -141,6 +158,7 @@ async def test_semantic_search_ordering(store):
 
 
 async def test_null_embeddings_still_searchable_relationally(store):
+    """NULL-vector rows are stored and counted but excluded from ANN search."""
     rows = _rows(2)
     for r in rows:
         r["embedding"] = None  # embeddings endpoint was down
@@ -151,6 +169,7 @@ async def test_null_embeddings_still_searchable_relationally(store):
 
 
 async def test_rebuild_replaces_everything(store):
+    """rebuild() wipes prior state and reloads from the supplied app map."""
     await store.replace_app_entries("app-old", "v1", _rows(4), _now())
     total = await store.rebuild(
         {"app-a": _rows(2, module="m1"), "app-b": _rows(3, module="m2")},
@@ -180,5 +199,6 @@ async def test_multihost_dsn_skips_dead_host():
 
 
 def test_to_vector_literal():
+    """to_vector_literal renders a float list as a pgvector literal, None as None."""
     assert to_vector_literal(None) is None
     assert to_vector_literal([1, 2.5, -0.5]) == "[1.0,2.5,-0.5]"

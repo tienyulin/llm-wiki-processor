@@ -21,6 +21,7 @@ class LLMProviderFactory:
 
     @classmethod
     def register(cls, name: str, provider_class: Type[LLMProvider]) -> None:
+        """Register a provider class under a (case-insensitive) name."""
         cls._providers[name.lower()] = provider_class
 
     @classmethod
@@ -33,12 +34,11 @@ class LLMProviderFactory:
         name = config.provider.lower()
         if name not in cls._providers:
             available = ", ".join(sorted(cls._providers))
-            raise ConfigurationException(
-                f"Unknown provider: '{name}'. Available: {available}"
-            )
-        logger.info(f"Creating '{name}' provider (model={config.model})")
+            raise ConfigurationException(f"Unknown provider: '{name}'. Available: {available}")
+        logger.info("Creating '%s' provider (model=%s)", name, config.model)
         return cls._providers[name](config)
 
     @classmethod
     def available(cls) -> list[str]:
+        """Return the sorted names of all registered providers."""
         return sorted(cls._providers)

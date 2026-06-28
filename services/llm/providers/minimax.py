@@ -9,7 +9,12 @@ import httpx
 
 from ..base import LLMProvider
 from ..config import LLMConfig
-from ..exceptions import APIException, AuthenticationException, RateLimitException, ValidationException
+from ..exceptions import (
+    APIException,
+    AuthenticationException,
+    RateLimitException,
+    ValidationException,
+)
 from ..factory import LLMProviderFactory
 
 logger = logging.getLogger(__name__)
@@ -21,7 +26,7 @@ class MinimaxProvider(LLMProvider):
     """Minimax LLM API provider."""
 
     def __init__(self, config: LLMConfig):
-        self.config = config
+        super().__init__(config)
         self.mock_mode = os.getenv("MOCK_LLM", "false").lower() == "true"
         if self.mock_mode:
             logger.warning("MinimaxProvider: running in MOCK mode")
@@ -64,12 +69,10 @@ class MinimaxProvider(LLMProvider):
                 result = response.json()
                 return result["choices"][0]["message"]["content"]
 
-            except (AuthenticationException, RateLimitException):
-                raise
             except (KeyError, json.JSONDecodeError) as e:
-                raise ValidationException(f"Unexpected Minimax response: {e}")
+                raise ValidationException(f"Unexpected Minimax response: {e}") from e
             except httpx.HTTPStatusError as e:
-                raise APIException(f"Minimax API error: {e}")
+                raise APIException(f"Minimax API error: {e}") from e
 
     async def validate_config(self) -> bool:
         if self.mock_mode or not self.config.api_key:
@@ -93,8 +96,8 @@ class MinimaxProvider(LLMProvider):
                 return True
         except AuthenticationException:
             raise
-        except Exception as e:
-            logger.error(f"MinimaxProvider validation failed: {e}")
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.error("MinimaxProvider validation failed: %s", e)
             return False
 
     def get_model_info(self) -> Dict[str, Any]:
@@ -104,6 +107,7 @@ class MinimaxProvider(LLMProvider):
             "max_context": 16000,
             "supports_streaming": False,
         }
+
 
 # Register with factory
 LLMProviderFactory.register("minimax", MinimaxProvider)

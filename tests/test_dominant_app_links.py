@@ -4,6 +4,7 @@ across many apps and got linked to unrelated concepts (items, refunds).
 
 Numbers below are the real measured cosines from that run.
 """
+
 from repository.pg_store import _dominant_app_links
 
 T, M = 0.63, 0.05  # production defaults
@@ -39,6 +40,7 @@ FASTAPI = [  # generic how-to — flat across apps, must link to NOTHING
 
 
 def test_specific_docs_link_to_their_app():
+    """Docs whose top match's app dominates link to that app's endpoints."""
     assert all(m == "flashback-api" for m, _, _ in _dominant_app_links(ORACLE, T, M))
     assert ("flashback-api", "POST /recover", 0.656) in _dominant_app_links(SYN, T, M)
     jwt = _dominant_app_links(JWT, T, M)
@@ -46,11 +48,13 @@ def test_specific_docs_link_to_their_app():
 
 
 def test_generic_doc_links_to_nothing():
+    """A doc similar to many apps fails the dominance margin and links to nothing."""
     # The bug: fastapi-howto used to false-link to items + refunds.
     assert _dominant_app_links(FASTAPI, T, M) == []
 
 
 def test_floor_excludes_weak_same_app_matches():
+    """Same-app matches below the cosine floor are dropped."""
     # syn-kb: GET /health (0.605) is same-app but below the 0.63 floor → dropped.
     keys = [k for _, k, _ in _dominant_app_links(SYN, T, M)]
     assert "GET /health" not in keys
@@ -58,4 +62,5 @@ def test_floor_excludes_weak_same_app_matches():
 
 
 def test_empty():
+    """No candidates yields no links."""
     assert _dominant_app_links([], T, M) == []

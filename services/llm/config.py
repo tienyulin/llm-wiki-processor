@@ -1,6 +1,6 @@
 """LLM Provider Configuration"""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Dict
 import os
 
@@ -11,14 +11,15 @@ from .exceptions import ConfigurationException
 class LLMConfig:
     """Configuration for LLM providers"""
 
-    provider: str          # "openai", "anthropic", "gemini", "groq", "azure", "openai-compatible", "minimax"
-    api_key: str           # API key/token
-    model: str             # Model name (provider-specific)
+    provider: (
+        str  # "openai", "anthropic", "gemini", "groq", "azure", "openai-compatible", "minimax"
+    )
+    api_key: str  # API key/token
+    model: str  # Model name (provider-specific)
     temperature: float = 0.7
     max_tokens: int = 4000
     base_url: Optional[str] = None  # For openai-compatible self-hosted services
     timeout_seconds: int = 60
-    extra: Dict = field(default_factory=dict)
 
     def __post_init__(self):
         if not self.provider:
@@ -58,10 +59,7 @@ def load_from_env() -> LLMConfig:
     provider = os.getenv("LLM_PROVIDER", "minimax").lower()
 
     # Backward-compatible API key fallback
-    api_key = (
-        os.getenv("LLM_API_KEY")
-        or os.getenv("MINIMAX_API_KEY", "")
-    )
+    api_key = os.getenv("LLM_API_KEY") or os.getenv("MINIMAX_API_KEY") or ""
 
     model = os.getenv("LLM_MODEL") or _PROVIDER_DEFAULTS.get(provider, "")
     temperature = float(os.getenv("LLM_TEMPERATURE", "0.7"))

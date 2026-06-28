@@ -7,8 +7,12 @@ from typing import Dict, Any, Optional
 import httpx
 
 from ..base import LLMProvider
-from ..config import LLMConfig
-from ..exceptions import APIException, AuthenticationException, RateLimitException, ValidationException
+from ..exceptions import (
+    APIException,
+    AuthenticationException,
+    RateLimitException,
+    ValidationException,
+)
 from ..factory import LLMProviderFactory
 
 logger = logging.getLogger(__name__)
@@ -19,9 +23,6 @@ _ANTHROPIC_VERSION = "2023-06-01"
 
 class AnthropicProvider(LLMProvider):
     """Anthropic Claude LLM provider."""
-
-    def __init__(self, config: LLMConfig):
-        self.config = config
 
     async def generate(
         self,
@@ -60,12 +61,10 @@ class AnthropicProvider(LLMProvider):
                 # Claude response: content[0].text
                 return result["content"][0]["text"]
 
-            except (AuthenticationException, RateLimitException):
-                raise
             except (KeyError, json.JSONDecodeError) as e:
-                raise ValidationException(f"Unexpected Anthropic response: {e}")
+                raise ValidationException(f"Unexpected Anthropic response: {e}") from e
             except httpx.HTTPStatusError as e:
-                raise APIException(f"Anthropic API error: {e}")
+                raise APIException(f"Anthropic API error: {e}") from e
 
     async def validate_config(self) -> bool:
         try:
@@ -90,8 +89,8 @@ class AnthropicProvider(LLMProvider):
                 return True
         except AuthenticationException:
             raise
-        except Exception as e:
-            logger.error(f"AnthropicProvider validation failed: {e}")
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.error("AnthropicProvider validation failed: %s", e)
             return False
 
     def get_model_info(self) -> Dict[str, Any]:
@@ -101,6 +100,7 @@ class AnthropicProvider(LLMProvider):
             "max_context": 200000,
             "supports_streaming": True,
         }
+
 
 # Register with factory
 LLMProviderFactory.register("anthropic", AnthropicProvider)

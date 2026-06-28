@@ -147,9 +147,7 @@ def _dominant_app_links(candidates: list[tuple], threshold: float, margin: float
     if best_score - other_best < margin:
         return []
     return [
-        (m, k, round(s, 4))
-        for (m, k, app, s) in candidates
-        if app == best_app and s >= threshold
+        (m, k, round(s, 4)) for (m, k, app, s) in candidates if app == best_app and s >= threshold
     ]
 
 
@@ -192,6 +190,7 @@ class PGVectorStore:
                 self._opened = True
 
     async def aclose(self):
+        """Close the connection pool if it was opened."""
         if self._opened:
             await self._pool.close()
             self._opened = False
@@ -212,7 +211,10 @@ class PGVectorStore:
             for extension in ("vector", "pg_trgm"):
                 try:
                     await conn.execute(f"CREATE EXTENSION IF NOT EXISTS {extension}")
-                except Exception:
+                # CREATE EXTENSION can fail for several privilege/availability
+                # reasons (non-superuser role, missing package); recover by
+                # checking whether it already exists.
+                except Exception as exc:  # pylint: disable=broad-exception-caught
                     # Not superuser — fine if the extension already exists.
                     await conn.rollback()
                     cur = await conn.execute(
@@ -223,7 +225,7 @@ class PGVectorStore:
                             f"The {extension} extension is not installed and this "
                             f"role cannot create it; run db/init/01-extension.sql "
                             f"as superuser"
-                        )
+                        ) from exc
 
             existing_dim = await self._embedding_dim(conn)
             if existing_dim is not None and existing_dim != dim:
@@ -258,14 +260,12 @@ class PGVectorStore:
         """Dimension of the existing embedding column, or None if no table.
 
         pgvector stores the dimension directly as the column's atttypmod."""
-        cur = await conn.execute(
-            """
+        cur = await conn.execute("""
             SELECT a.atttypmod
             FROM pg_attribute a
             JOIN pg_class c ON c.oid = a.attrelid
             WHERE c.relname = 'api_entries' AND a.attname = 'embedding'
-            """
-        )
+            """)
         row = await cur.fetchone()
         return row[0] if row else None
 
@@ -309,14 +309,10 @@ class PGVectorStore:
                     (source_app, synced_at, source_version),
                 )
                 if await cur.fetchone() is None:
-                    logger.warning(
-                        f"PG sync for {source_app} at {synced_at} is stale, skipping"
-                    )
+                    logger.warning("PG sync for %s at %s is stale, skipping", source_app, synced_at)
                     return False
 
-                await conn.execute(
-                    "DELETE FROM api_entries WHERE source_app = %s", (source_app,)
-                )
+                await conn.execute("DELETE FROM api_entries WHERE source_app = %s", (source_app,))
                 await self._insert_rows(conn, source_app, source_version, rows)
                 await self._set_state(
                     conn,
@@ -358,7 +354,7 @@ class PGVectorStore:
                     (source_app, synced_at, source_version),
                 )
                 if await cur.fetchone() is None:
-                    logger.warning(f"PG knowledge sync for {source_app} is stale, skipping")
+                    logger.warning("PG knowledge sync for %s is stale, skipping", source_app)
                     return False
 
                 await conn.execute(
@@ -370,9 +366,13 @@ class PGVectorStore:
                             _INSERT_KNOWLEDGE_SQL,
                             [
                                 (
-                                    r["doc_id"], source_app, source_version,
-                                    r.get("title", ""), Jsonb(r["detail"]),
-                                    r["embed_text"], to_vector_literal(r.get("embedding")),
+                                    r["doc_id"],
+                                    source_app,
+                                    source_version,
+                                    r.get("title", ""),
+                                    Jsonb(r["detail"]),
+                                    r["embed_text"],
+                                    to_vector_literal(r.get("embedding")),
                                     r.get("embedding_model"),
                                 )
                                 for r in rows
@@ -492,23 +492,26 @@ class PGVectorStore:
     # ------------------------------------------------------------------
 
     async def available(self) -> bool:
+        """True if a trivial query succeeds; any failure means PG is unavailable."""
         try:
             await self._ensure_open()
             async with self._pool.connection() as conn:
                 await conn.execute("SELECT 1")
             return True
-        except Exception as e:
-            logger.debug(f"PG availability probe failed: {e}")
+        # Availability probe: any connection/query error simply means "not
+        # available", so it must swallow every exception type.
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.debug("PG availability probe failed: %s", e)
             return False
 
     async def count_entries(self) -> tuple[int, int]:
         """(total entries, entries with an embedding)."""
         await self._ensure_open()
         async with self._pool.connection() as conn:
-            cur = await conn.execute(
-                "SELECT count(*), count(embedding) FROM api_entries"
-            )
-            total, embedded = await cur.fetchone()
+            cur = await conn.execute("SELECT count(*), count(embedding) FROM api_entries")
+            row = await cur.fetchone()
+            assert row is not None  # count(*) always returns exactly one row
+            total, embedded = row
             return total, embedded
 
     async def semantic_search(self, query_vec: list[float], top_k: int = 10) -> list[dict]:

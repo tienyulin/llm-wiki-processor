@@ -1,3 +1,5 @@
+"""API package: aggregates the wiki-processor routers."""
+
 from fastapi import APIRouter
 
 from api.routers import admin, process, system

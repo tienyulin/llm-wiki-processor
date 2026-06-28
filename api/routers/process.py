@@ -1,3 +1,5 @@
+"""Processing endpoint: ingest markdown / OpenAPI into the wiki."""
+
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -35,5 +37,5 @@ async def process(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Unexpected error during processing: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Processing error: {e}")
+        logger.error("Unexpected error during processing: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Processing error: {e}") from e

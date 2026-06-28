@@ -1,9 +1,17 @@
 """Embedding provider configuration."""
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from services.llm.exceptions import ConfigurationException
+
+
+@dataclass
+class RequestTuning:
+    """HTTP request-execution knobs for the embeddings endpoint."""
+
+    batch_size: int = 64
+    timeout_seconds: int = 30
 
 
 @dataclass
@@ -18,8 +26,7 @@ class EmbeddingConfig:
     api_key: str = ""
     model: str = "text-embedding-3-small"
     dim: int = 1536
-    batch_size: int = 64
-    timeout_seconds: int = 30
+    request: RequestTuning = field(default_factory=RequestTuning)
     mock_mode: bool = False
     # Send {"dimensions": dim} in the request. Needed for models whose native
     # output exceeds the wanted size (e.g. Gemini gemini-embedding-001 defaults
@@ -27,12 +34,22 @@ class EmbeddingConfig:
     # text-embedding-3-*. Off by default: older models reject the parameter.
     send_dimensions: bool = False
 
+    @property
+    def batch_size(self) -> int:
+        """Texts sent per /v1/embeddings request."""
+        return self.request.batch_size
+
+    @property
+    def timeout_seconds(self) -> int:
+        """HTTP timeout, in seconds, for each embeddings request."""
+        return self.request.timeout_seconds
+
     def __post_init__(self):
         if self.dim <= 0:
             raise ConfigurationException("EMBEDDING_DIM must be positive")
-        if self.batch_size <= 0:
+        if self.request.batch_size <= 0:
             raise ConfigurationException("EMBEDDING_BATCH_SIZE must be positive")
-        if self.timeout_seconds <= 0:
+        if self.request.timeout_seconds <= 0:
             raise ConfigurationException("EMBEDDING_TIMEOUT must be positive")
 
     def is_enabled(self) -> bool:
@@ -60,8 +77,10 @@ def load_embedding_env() -> EmbeddingConfig:
         api_key=os.getenv("EMBEDDING_API_KEY", ""),
         model=os.getenv("EMBEDDING_MODEL", "text-embedding-3-small"),
         dim=int(os.getenv("EMBEDDING_DIM", "1536")),
-        batch_size=int(os.getenv("EMBEDDING_BATCH_SIZE", "64")),
-        timeout_seconds=int(os.getenv("EMBEDDING_TIMEOUT", "30")),
+        request=RequestTuning(
+            batch_size=int(os.getenv("EMBEDDING_BATCH_SIZE", "64")),
+            timeout_seconds=int(os.getenv("EMBEDDING_TIMEOUT", "30")),
+        ),
         mock_mode=os.getenv("MOCK_EMBEDDINGS", "false").lower() == "true",
         send_dimensions=os.getenv("EMBEDDING_SEND_DIMENSIONS", "false").lower() == "true",
     )

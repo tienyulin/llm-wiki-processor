@@ -1,3 +1,5 @@
+"""System endpoints: wiki status and health checks."""
+
 import logging
 from typing import Optional
 
@@ -23,8 +25,8 @@ async def status(storage: MinioStorage = Depends(get_storage)):
     try:
         return system_service.build_status(storage)
     except Exception as e:
-        logger.error(f"Status check error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("Status check error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @router.get("/health", response_model=HealthResponse)

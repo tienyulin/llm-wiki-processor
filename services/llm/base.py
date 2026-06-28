@@ -9,6 +9,7 @@ import re
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional
 
+from .config import LLMConfig
 from .exceptions import APIException, RateLimitException
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,11 @@ class LLMProvider(ABC):
         validate_config() - check API key / connectivity
         get_model_info() - return model metadata
     """
+
+    def __init__(self, config: LLMConfig) -> None:
+        self.config = config
+        # Lazily-built per-process concurrency cap (see _llm_semaphore).
+        self._sem: Optional[asyncio.Semaphore] = None
 
     @abstractmethod
     async def generate(
@@ -97,6 +103,8 @@ class LLMProvider(ABC):
         the processor never exceeds the provider's rate — queuing the rest — is
         the real lever. Tunable via LLM_MAX_CONCURRENCY (default 3).
         """
+        # Defensive getattr (mirrors is_configured): test-double providers may
+        # subclass without calling super().__init__(), so _sem can be absent.
         sem = getattr(self, "_sem", None)
         if sem is None:
             sem = asyncio.Semaphore(int(os.getenv("LLM_MAX_CONCURRENCY", "3")))
@@ -116,12 +124,18 @@ class LLMProvider(ABC):
             except (RateLimitException, APIException) as e:
                 if attempt == attempts:
                     raise
-                delay = base * (2 ** attempt) + random.uniform(0, base)
+                delay = base * (2**attempt) + random.uniform(0, base)
                 logger.warning(
-                    f"{type(self).__name__}: {type(e).__name__}, retry "
-                    f"{attempt + 1}/{attempts} in {delay:.1f}s"
+                    "%s: %s, retry %d/%d in %.1fs",
+                    type(self).__name__,
+                    type(e).__name__,
+                    attempt + 1,
+                    attempts,
+                    delay,
                 )
                 await asyncio.sleep(delay)
+        # Unreachable: the final attempt always re-raises above.
+        raise APIException("LLM retries exhausted")
 
     def extract_json(self, content: str) -> dict:
         """Strip <think> tags and parse JSON from an LLM response."""
@@ -204,7 +218,7 @@ class LLMProvider(ABC):
             }
 
         combined = "\n\n".join(f"## File: {fn}\n{c}" for fn, c in markdowns.items())
-        logger.info(f"{type(self).__name__}: initial wiki generation ({len(combined)} chars)")
+        logger.info("%s: initial wiki generation (%d chars)", type(self).__name__, len(combined))
         analysis = await self._analyze(combined)
         return await self._generate_from_analysis(combined, analysis)
 
@@ -238,9 +252,8 @@ class LLMProvider(ABC):
             "Output ONLY valid JSON, no markdown, in this exact shape:\n"
             '{"apis": {"<module>": {"<METHOD /path>": {"method": "...", "path": "...", '
             '"description": "...", "sources": ["<source filename>"]}}}, "metadata": {}}\n'
-            "Every endpoint MUST include a non-empty \"sources\" list naming the markdown "
-            "file(s) it was extracted from."
-            + _LANGUAGE_RULE
+            'Every endpoint MUST include a non-empty "sources" list naming the markdown '
+            "file(s) it was extracted from." + _LANGUAGE_RULE
         )
         content = await self._generate_retry(prompt, temperature=0.3)
         return self.extract_json(content)
@@ -265,13 +278,11 @@ class LLMProvider(ABC):
         app's entries — the processor merges them into the shared wiki.
         """
         if self._mock_mode():
-            return {
-                "apis": self._mock_apis_from_markdowns(changed_markdowns, source_app)
-            }
+            return {"apis": self._mock_apis_from_markdowns(changed_markdowns, source_app)}
 
         changed_content = "\n\n".join(f"## File: {fn}\n{c}" for fn, c in changed_markdowns.items())
         current_summary = json.dumps(current_apis, ensure_ascii=False, indent=2)[:2000]
-        logger.info(f"{type(self).__name__}: incremental update")
+        logger.info("%s: incremental update", type(self).__name__)
         context = (
             f"Current API entries for this application (summarized):\n{current_summary}\n\n"
             f"Changes: {json.dumps(changes) if isinstance(changes, dict) else changes}\n\n"
@@ -316,7 +327,8 @@ class LLMProvider(ABC):
         prompt = (
             f"Write a concise one-paragraph overview of the '{app}' service based on its "
             "API endpoints below. State its purpose and main capabilities. Plain text only."
-            + _LANGUAGE_RULE + "\n\n"
+            + _LANGUAGE_RULE
+            + "\n\n"
             + "\n".join(lines)
         )
         return (await self._generate_retry(prompt, temperature=0.3)).strip()
@@ -354,10 +366,14 @@ class LLMProvider(ABC):
         for doc_id, entry in (knowledge or {}).items():
             if not isinstance(entry, dict):
                 continue
-            text = " ".join([
-                entry.get("title", ""), entry.get("summary", ""),
-                " ".join(entry.get("topics", [])), " ".join(entry.get("key_points", [])),
-            ]).lower()
+            text = " ".join(
+                [
+                    entry.get("title", ""),
+                    entry.get("summary", ""),
+                    " ".join(entry.get("topics", [])),
+                    " ".join(entry.get("key_points", [])),
+                ]
+            ).lower()
             app = entry.get("source_app", "")
             for token, c in concepts.items():
                 if token in text:
@@ -373,7 +389,7 @@ class LLMProvider(ABC):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _doc_id(source_app: str, filename: str) -> str:
+    def _doc_id(source_app: Optional[str], filename: str) -> str:
         stem = filename.rsplit(".", 1)[0]
         return f"{source_app}:{stem}" if source_app else stem
 
@@ -396,7 +412,7 @@ class LLMProvider(ABC):
                 if body.startswith("---"):
                     end = body.find("---", 3)
                     if end != -1:
-                        body = body[end + 3:]
+                        body = body[end + 3 :]
                 h1 = _H1_RE.search(content)
                 title = h1.group(1).strip() if h1 else filename
                 headings = re.findall(r"^#{1,6}\s+(.+)$", body, re.MULTILINE)
@@ -404,8 +420,10 @@ class LLMProvider(ABC):
                 # Summary: first non-heading, non-bullet prose, generously sized
                 # so keyword search over the entry finds in-body terms.
                 prose = "\n".join(
-                    ln for ln in body.splitlines()
-                    if ln.strip() and not ln.lstrip().startswith(("#", "-", "*"))
+                    ln
+                    for ln in body.splitlines()
+                    if ln.strip()
+                    and not ln.lstrip().startswith(("#", "-", "*"))
                     and not re.match(r"^\s*\d+\.\s", ln)
                 )
                 out[self._doc_id(source_app, filename)] = {
@@ -423,8 +441,7 @@ class LLMProvider(ABC):
             "topics, and the key takeaways someone would act on.\n\n"
             "Output ONLY valid JSON keyed by a short doc id:\n"
             '{"<doc_id>": {"title": "...", "summary": "...", "topics": ["..."], '
-            '"key_points": ["..."]}}'
-            + _LANGUAGE_RULE + "\n\n"
+            '"key_points": ["..."]}}' + _LANGUAGE_RULE + "\n\n"
             f"{combined}"
         )
         return self.extract_json(await self._generate_retry(prompt, temperature=0.3))

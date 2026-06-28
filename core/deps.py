@@ -26,27 +26,29 @@ logger = logging.getLogger(__name__)
 
 @lru_cache(maxsize=1)
 def get_storage() -> MinioStorage:
+    """Return the cached MinIO storage client."""
     return MinioStorage()
 
 
 @lru_cache(maxsize=1)
 def get_llm() -> LLMProvider:
+    """Return the cached LLM provider built from settings."""
     settings = get_settings()
     provider = LLMProviderFactory.create(settings.llm)
-    logger.info(
-        f"LLM provider initialized: {settings.llm.provider} / {settings.llm.model}"
-    )
+    logger.info("LLM provider initialized: %s / %s", settings.llm.provider, settings.llm.model)
     return provider
 
 
 @lru_cache(maxsize=1)
 def get_embedder() -> Optional[EmbeddingClient]:
+    """Return the cached embedding client, or None when embeddings are disabled."""
     cfg = get_settings().embeddings
     return EmbeddingClient(cfg) if cfg.is_enabled() else None
 
 
 @lru_cache(maxsize=1)
 def get_vector_store() -> Optional[PGVectorStore]:
+    """Return the cached pgvector store, or None when PG_DSN is unset."""
     store = pg_store_from_env()
     if store is None:
         logger.warning(
@@ -55,14 +57,16 @@ def get_vector_store() -> Optional[PGVectorStore]:
         )
     else:
         logger.info(
-            f"Vector index enabled (dim={store.dim}, "
-            f"embeddings={'on' if get_embedder() else 'off — relational sync only'})"
+            "Vector index enabled (dim=%d, embeddings=%s)",
+            store.dim,
+            "on" if get_embedder() else "off — relational sync only",
         )
     return store
 
 
 @lru_cache(maxsize=1)
 def get_processor() -> WikiProcessor:
+    """Return the cached WikiProcessor wired with all dependencies."""
     return WikiProcessor(
         storage=get_storage(),
         llm=get_llm(),

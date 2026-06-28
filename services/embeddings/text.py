@@ -37,8 +37,11 @@ def entry_to_text(module: str, api_key: str, detail) -> str:
     return " | ".join(p for p in parts if p)
 
 
-def knowledge_to_text(doc_id: str, entry) -> str:
+def knowledge_to_text(_doc_id: str, entry) -> str:
     """Build the text to embed for one knowledge document.
+
+    ``_doc_id`` is accepted to mirror ``entry_to_text``'s keyed signature but is
+    not part of the embedded text — knowledge vectors are content-only.
 
     Concatenates title | summary | topics | key_points — the distilled fields,
     which for these short docs act as one focused chunk (good embedding recall

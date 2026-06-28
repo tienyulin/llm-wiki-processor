@@ -8,7 +8,7 @@
   ],
   "shutdownAction": "stopCompose",
   "forwardPorts": [8001, 9000, 9001, 5432],
-  "postCreateCommand": "pip install -r requirements.txt",
+  "postCreateCommand": "apt-get update && apt-get install -y --no-install-recommends git && pip install -r requirements.txt && pre-commit install --hook-type pre-commit --hook-type pre-push",
   "remoteEnv": {
     "MOCK_LLM": "true",
     "MOCK_EMBEDDINGS": "true"
