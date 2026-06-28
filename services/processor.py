@@ -51,7 +51,6 @@ def _looks_like_api(markdowns: dict) -> bool:
     return False
 
 
-_KNOWLEDGE_TYPES = {"tutorial", "how-to", "reference", "explanation"}
 _FM_LIST_RE = re.compile(r"^\[(.*)\]$")
 
 
@@ -575,16 +574,21 @@ class WikiProcessor(VectorSyncMixin):
     def _resolve_kind(
         doc_type: str | None, openapi: dict | None, fm_type: str | None, markdowns: dict
     ) -> str:
-        """Pick the push kind. Precedence: explicit doc_type > openapi present >
-        frontmatter type > content auto-detection."""
+        """Pick the push kind — always "api" or "knowledge".
+
+        A *declared* type is authoritative: only ``api`` (or an attached OpenAPI
+        spec) is an API push; every other declared type is knowledge. The
+        endpoint heuristic is a last resort, used only when nothing declares a
+        type, so a compliant doc is never reclassified by stray endpoint-shaped
+        prose (e.g. a runbook that mentions ``POST /charge``). Type matching is
+        case-insensitive. Precedence: explicit doc_type > attached openapi >
+        frontmatter type > content heuristic."""
         if doc_type:
-            return doc_type
+            return "api" if doc_type.strip().lower() == "api" else "knowledge"
         if openapi:
             return "api"
-        if fm_type == "api":
-            return "api"
-        if fm_type in _KNOWLEDGE_TYPES:
-            return "knowledge"
+        if fm_type:
+            return "api" if fm_type.strip().lower() == "api" else "knowledge"
         return "api" if _looks_like_api(markdowns) else "knowledge"
 
     async def _extract_knowledge(self, ctx: _PushContext, inputs: _ExtractInputs) -> _Extraction:
